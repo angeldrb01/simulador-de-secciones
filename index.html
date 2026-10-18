@@ -43,7 +43,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:9px 7px;border-bottom:1p
 <div id="progress" class="progress hidden"><div class="progressTop"><b id="pt">Preparando…</b><span id="pp">0%</span></div><div class="track"><div id="bar" class="bar"></div></div><div id="pd" class="muted"></div></div>
 </section>
 
-<section class="card hidden" id="candSec"><div class="head"><div><h2>3. Páginas seleccionadas</h2><p>Selección determinista previa a la IA.</p></div></div><div id="cand" class="candidates"></div></section>
+<section class="card hidden" id="candSec"><div class="head"><div><h2>3. Páginas seleccionadas</h2><p>Selección determinista previa a la IA. En fichas técnicas se reconstruyen filas y columnas antes del análisis para preservar las tablas.</p></div></div><div id="cand" class="candidates"></div></section>
 
 <section class="card hidden" id="resSec"><div class="head"><div><h2>4. Datos extraídos</h2><p>Política de fuentes: ficha técnica → datos eléctricos; manual → criterios/recomendaciones de instalación. Un dato solo se acepta si su valor y evidencia pueden corroborarse contra el texto de la página.</p></div></div><div id="summary" class="notice"></div><div id="results"></div><details><summary>Ver salida técnica</summary><pre id="raw"></pre></details></section>
 </main>
@@ -202,9 +202,44 @@ async function checkCompat(){
  $('#compatHelp').textContent=help;$('#compatHelp').classList.toggle('hidden',!help);const needsModel=state.models.length>1&&!$('#model').value;$('#analyze').disabled=!state.files.length||!secure||!api||['unavailable','error'].includes(textAv)||needsModel;return textAv;
 }
 
+
+function buildLayoutText(items){
+ const cells=(items||[])
+  .filter(it=>it&&typeof it.str==='string'&&it.str.trim())
+  .map(it=>({text:it.str.trim(),x:Number(it.transform?.[4]||0),y:Number(it.transform?.[5]||0),w:Number(it.width||0)}));
+ cells.sort((a,b)=>Math.abs(b.y-a.y)>2.2?b.y-a.y:a.x-b.x);
+ const rows=[];
+ for(const cell of cells){
+  let row=rows.find(r=>Math.abs(r.y-cell.y)<=2.2);
+  if(!row){row={y:cell.y,cells:[]};rows.push(row)}
+  row.cells.push(cell);
+ }
+ rows.sort((a,b)=>b.y-a.y);
+ return rows.map(r=>{
+  r.cells.sort((a,b)=>a.x-b.x);
+  let line='',lastEnd=null;
+  for(const cell of r.cells){
+   if(lastEnd!==null){
+    const gap=cell.x-lastEnd;
+    line+=gap>18?'\t':' ';
+   }
+   line+=cell.text;
+   lastEnd=cell.x+Math.max(cell.w,cell.text.length*3);
+  }
+  return norm(line);
+ }).filter(Boolean).join('\n');
+}
 async function extractPdf(file,idx){
  const data=new Uint8Array(await file.arrayBuffer()),pdf=await pdfjsLib.getDocument({data}).promise,docId='d'+idx,rows=[];
- for(let p=1;p<=pdf.numPages;p++){if(state.controller.signal.aborted)throw new DOMException('Cancelado','AbortError');const page=await pdf.getPage(p),tc=await page.getTextContent(),text=norm(tc.items.map(x=>x.str).join(' '));rows.push({docId,docName:file.name,pageNumber:p,pageCount:pdf.numPages,text});setProgress(15+35*((state.pages.length+p)/(Math.max(1,pdf.numPages*state.files.length))),'Leyendo PDFs',file.name+' · pág. '+p+'/'+pdf.numPages);page.cleanup()}
+ for(let p=1;p<=pdf.numPages;p++){
+  if(state.controller.signal.aborted)throw new DOMException('Cancelado','AbortError');
+  const page=await pdf.getPage(p),tc=await page.getTextContent();
+  const text=norm(tc.items.map(x=>x.str).join(' '));
+  const layoutText=buildLayoutText(tc.items);
+  rows.push({docId,docName:file.name,pageNumber:p,pageCount:pdf.numPages,text,layoutText});
+  setProgress(15+35*((state.pages.length+p)/(Math.max(1,pdf.numPages*state.files.length))),'Leyendo PDFs',file.name+' · pág. '+p+'/'+pdf.numPages);
+  page.cleanup()
+}
  const sample=(rows.slice(0,Math.min(10,rows.length)).map(x=>x.text).join(' ')+' '+file.name).toLowerCase();
  let role='otro';
  const datasheetHits=(sample.match(/datasheet|data sheet|technical data|technical specifications|specifications|ficha técnica|datos técnicos/g)||[]).length;
@@ -217,7 +252,7 @@ async function extractPdf(file,idx){
 function choosePages(pages,max){
  const target=norm($('#model').value).toLowerCase();
  const scored=pages.map(p=>{
-  const low=p.text.toLowerCase();let score=0,h=[];
+  const low=(p.text+' '+(p.layoutText||'')).toLowerCase();let score=0,h=[];
   for(const [k,w] of keywords)if(low.includes(k)){score+=w;h.push(k)}
   if(target&&low.includes(target)){score+=80;h.unshift('modelo exacto: '+target)}
   if(p.docRole==='ficha técnica'){
@@ -312,8 +347,10 @@ async function analyzePage(c){
   'Extrae únicamente hechos que estén EXPLÍCITOS en el texto. No infieras ni calcules nada. Conserva exactamente el valor y todos sus decimales tal como aparecen; no redondees ni trunques. '+
   'Campos permitidos: '+allowed+'.\n'+
   'Devuelve SOLO JSON válido con esta forma exacta: {"fields":[{"field":"max_ac_current","value":"43.3","unit":"A","evidence":"fragmento literal corto del texto","model_context":"GW25K-ET"}]}. '+
-  'Si no hay datos inequívocos, devuelve {"fields":[]}. evidence debe copiar literalmente una parte del texto que permita verificar el valor.\n\n'+
-  'TEXTO DE LA PÁGINA:\n'+c.text.slice(0,7500);
+  'Si no hay datos inequívocos, devuelve {"fields":[]}. evidence debe copiar literalmente una parte del texto que permita verificar el valor.\n'+
+  (c.docRole==='ficha técnica'
+   ? 'IMPORTANTE: el bloque siguiente conserva aproximadamente las FILAS de la tabla. Las tabulaciones separan celdas/columnas. Identifica primero la columna del MODELO OBJETIVO y extrae de esa misma columna todos los campos inequívocos. No mezcles columnas.\n\nTEXTO MAQUETADO DE LA PÁGINA:\n'+(c.layoutText||c.text).slice(0,10500)
+   : '\nTEXTO DE LA PÁGINA:\n'+c.text.slice(0,7500));
  try{
   const raw=await s.prompt(prompt,{signal:state.controller.signal});
   const parsed=parseJsonLoose(raw);
