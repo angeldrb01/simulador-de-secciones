@@ -43,9 +43,9 @@ table{width:100%;border-collapse:collapse}th,td{padding:9px 7px;border-bottom:1p
 <div id="progress" class="progress hidden"><div class="progressTop"><b id="pt">Preparando…</b><span id="pp">0%</span></div><div class="track"><div id="bar" class="bar"></div></div><div id="pd" class="muted"></div></div>
 </section>
 
-<section class="card hidden" id="candSec"><div class="head"><div><h2>3. Páginas seleccionadas</h2><p>Selección determinista previa a la IA. En fichas técnicas se reconstruyen filas y columnas antes del análisis para preservar las tablas.</p></div></div><div id="cand" class="candidates"></div></section>
+<section class="card hidden" id="candSec"><div class="head"><div><h2>3. Páginas seleccionadas</h2><p>Selección determinista previa a la IA. Las páginas relevantes se renderizan como imagen para que Gemini interprete tablas, celdas combinadas y valores comunes a varios modelos.</p></div></div><div id="cand" class="candidates"></div></section>
 
-<section class="card hidden" id="resSec"><div class="head"><div><h2>4. Datos extraídos</h2><p>Política de fuentes: ficha técnica → datos eléctricos; manual → criterios/recomendaciones de instalación. En tablas multi-modelo, el valor se toma de la columna física del modelo seleccionado; la IA solo clasifica el significado de la fila.</p></div></div><div id="summary" class="notice"></div><div id="results"></div><details><summary>Ver salida técnica</summary><pre id="raw"></pre></details></section>
+<section class="card hidden" id="resSec"><div class="head"><div><h2>4. Datos extraídos</h2><p>Política de fuentes: ficha técnica → datos eléctricos; manual → criterios/recomendaciones de instalación. Las tablas se interpretan visualmente y después se verifican contra el texto original del PDF antes de aceptar un dato.</p></div></div><div id="summary" class="notice"></div><div id="results"></div><details><summary>Ver salida técnica</summary><pre id="raw"></pre></details></section>
 </main>
 
 <script type="module">
@@ -53,7 +53,7 @@ import * as pdfjsLib from 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38
 pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs';
 
 const $=s=>document.querySelector(s);
-const state={files:[],docs:[],pages:[],candidates:[],results:[],aiErrors:[],models:[],modelSession:null,modelDetectSeq:0,session:null,visionSession:null,controller:null};
+const state={files:[],docs:[],pages:[],candidates:[],results:[],aiErrors:[],models:[],modelSession:null,modelDetectSeq:0,session:null,visionSession:null,visionVerifySession:null,controller:null};
 const keywords=[
  ['maximum ac output current',12],['max ac output current',12],['rated output current',11],['rated ac current',11],
  ['nominal output current',10],['output current',7],['rated output power',10],['rated ac power',10],['nominal ac power',10],
@@ -198,7 +198,7 @@ async function checkCompat(){
  const good=v=>v==='available', wait=v=>v==='downloadable'||v==='downloading';
  const items=[['Contexto seguro',secure?'Sí':'No',secure?'ok':'bad'],['Chrome',ver?'v'+ver:'No detectado',ver>=148?'ok':'warn'],['Gemini Nano · texto',textAv,good(textAv)?'ok':wait(textAv)?'warn':'bad'],['Visión (reserva)',imageAv,good(imageAv)?'ok':wait(imageAv)?'warn':'bad']];
  $('#compat').innerHTML=items.map(x=>'<div class="metric '+x[2]+'"><small>'+esc(x[0])+'</small><b>'+esc(x[1])+'</b></div>').join('');
- let help=''; if(!secure)help='La Prompt API necesita contexto seguro HTTPS.';else if(!api)help='Chrome no expone LanguageModel. Comprueba que Chrome esté actualizado.';else if(textAv==='downloadable')help='Compatible. Al analizar, Chrome descargará el modelo local por primera vez.';else if(textAv==='downloading')help='Chrome está descargando el modelo local.';else if(textAv==='available')help='Todo listo. La extracción usará primero texto; la visión queda como reserva para una fase posterior.';else if(textAv==='unavailable')help='Este equipo/configuración no cumple los requisitos actuales de la Prompt API.';if(err)help+=' Detalle: '+err;
+ let help=''; if(!secure)help='La Prompt API necesita contexto seguro HTTPS.';else if(!api)help='Chrome no expone LanguageModel. Comprueba que Chrome esté actualizado.';else if(textAv==='downloadable')help='Compatible. Al analizar, Chrome descargará el modelo local por primera vez.';else if(textAv==='downloading')help='Chrome está descargando el modelo local.';else if(textAv==='available')help='Todo listo. El texto localizará páginas relevantes y la visión analizará las tablas; después se hará una verificación independiente.';else if(textAv==='unavailable')help='Este equipo/configuración no cumple los requisitos actuales de la Prompt API.';if(err)help+=' Detalle: '+err;
  $('#compatHelp').textContent=help;$('#compatHelp').classList.toggle('hidden',!help);const needsModel=state.models.length>1&&!$('#model').value;$('#analyze').disabled=!state.files.length||!secure||!api||['unavailable','error'].includes(textAv)||needsModel;return textAv;
 }
 
@@ -326,7 +326,7 @@ function choosePages(pages,max){
  }
  return out.sort((a,b)=>b.score-a.score);
 }
-async function renderBlob(c){const d=state.docs.find(x=>x.docId===c.docId),p=await d.pdf.getPage(c.pageNumber),vp0=p.getViewport({scale:1}),scale=Math.min(1.8,Math.max(1,1150/vp0.width)),vp=p.getViewport({scale}),canvas=document.createElement('canvas');canvas.width=Math.floor(vp.width);canvas.height=Math.floor(vp.height);await p.render({canvasContext:canvas.getContext('2d',{alpha:false}),viewport:vp}).promise;const blob=await new Promise((r,j)=>canvas.toBlob(b=>b?r(b):j(new Error('No se pudo renderizar la página')),'image/jpeg',.82));p.cleanup();return blob}
+async function renderBlob(c){const d=state.docs.find(x=>x.docId===c.docId),p=await d.pdf.getPage(c.pageNumber),vp0=p.getViewport({scale:1}),scale=Math.min(2.6,Math.max(1.4,1800/vp0.width)),vp=p.getViewport({scale}),canvas=document.createElement('canvas');canvas.width=Math.floor(vp.width);canvas.height=Math.floor(vp.height);await p.render({canvasContext:canvas.getContext('2d',{alpha:false}),viewport:vp}).promise;const blob=await new Promise((r,j)=>canvas.toBlob(b=>b?r(b):j(new Error('No se pudo renderizar la página')),'image/jpeg',.9));p.cleanup();return blob}
 function numberTokens(s){return (String(s).match(/[-+]?\d+(?:[.,]\d+)?/g)||[]).map(x=>Number(x.replace(',','.'))).filter(Number.isFinite)}
 function exactNumericMatch(value,evidence){
  const v=numberTokens(value),e=numberTokens(evidence);
@@ -417,9 +417,9 @@ async function analyzeDatasheetColumn(c){
 }
 async function analyzePage(c){
  const target=norm($('#model').value);
- if(c.docRole==='ficha técnica'&&target){
-  const tab=await analyzeDatasheetColumn(c);
-  if(tab&&tab.results.length)return tab.results;
+ if(target&&shouldUseVision(c)){
+  const visual=await analyzePageVision(c);
+  if(visual.length)return visual;
  }
  const s=await ensureSession();
  const technicalFields=['manufacturer','model','rated_ac_power','max_apparent_power','nominal_ac_voltage','rated_ac_current','max_ac_current','frequency','power_factor','thdi','ac_connection'];
@@ -473,27 +473,86 @@ async function ensureVisionSession(){
  state.visionSession=await LanguageModel.create({
   expectedInputs:[{type:'text',languages:['es','en']},{type:'image'}],
   expectedOutputs:[{type:'text',languages:['es']}],
-  initialPrompts:[{role:'system',content:'Eres un extractor técnico visual extremadamente conservador. Lee tablas sin mezclar columnas entre modelos. Copia los valores exactamente como aparecen. No redondees, no calcules y no uses conocimiento externo.'}],
+  initialPrompts:[{role:'system',content:'Eres un extractor técnico visual extremadamente conservador. Interpreta la página como un documento visual completo: tablas, columnas, celdas combinadas, valores centrados que aplican a varias columnas y notas al pie. Nunca mezcles modelos. Copia valores y decimales exactamente como aparecen. No calcules, no redondees y no uses conocimiento externo. Si la relación entre un valor y el modelo no es visualmente inequívoca, omítelo.'}],
   signal:state.controller.signal
  });
  return state.visionSession;
 }
-async function analyzePageVision(c){
- const target=norm($('#model').value),s=await ensureVisionSession(),blob=await renderBlob(c);
- const technicalFields=['manufacturer','model','rated_ac_power','max_apparent_power','nominal_ac_voltage','rated_ac_current','max_ac_current','frequency','power_factor','thdi','ac_connection'];
+async function ensureVisionVerifySession(){
+ if(state.visionVerifySession)return state.visionVerifySession;
+ state.visionVerifySession=await LanguageModel.create({
+  expectedInputs:[{type:'text',languages:['es','en']},{type:'image'}],
+  expectedOutputs:[{type:'text',languages:['es']}],
+  initialPrompts:[{role:'system',content:'Actúas como revisor técnico independiente. Debes rechazar cualquier dato cuya relación visual con el modelo seleccionado no sea inequívoca. Comprueba especialmente celdas combinadas y valores compartidos por toda una fila. No corrijas ni propongas valores alternativos.'}],
+  signal:state.controller.signal
+ });
+ return state.visionVerifySession;
+}
+function visualLiteralCheck(c,f,target){
+ const page=norm(c.text).toLowerCase();
+ const valueOk=numberTokens(f.value).length ? exactNumericMatch(f.value,c.text) : page.includes(norm(f.value).toLowerCase());
+ const semantic=semanticMatch(f.field,f.row_label||f.evidence||'');
+ const modelOk=!target||page.includes(norm(target).toLowerCase());
+ if(!valueOk)return {ok:false,reason:'El valor exacto propuesto no aparece en el texto original de la página.'};
+ if(!semantic)return {ok:false,reason:'La etiqueta visual no corresponde semánticamente con el campo.'};
+ if(!modelOk)return {ok:false,reason:'El modelo seleccionado no aparece en el texto original de la página.'};
+ return {ok:true,reason:'Valor exacto y etiqueta corroborados contra el PDF; asociación modelo/valor confirmada en dos pasadas visuales.'};
+}
+async function verifyVisualCandidates(c,candidates,blob,target){
+ if(!candidates.length)return new Set();
+ const s=await ensureVisionVerifySession();
+ const compact=candidates.map((x,i)=>({id:'v'+i,field:x.field,value:x.value,unit:x.unit||'',row_label:x.row_label||'',scope:x.scope||'selected_model'}));
  const prompt=
-  'Analiza visualmente esta página de FICHA TÉCNICA. Documento: '+c.docName+'; página: '+c.pageNumber+'. '+
-  (target?'MODELO OBJETIVO: '+target+'. Usa exclusivamente la columna de ese modelo. ':'')+
-  'Extrae solo estos campos cuando sean inequívocos: '+technicalFields.join(', ')+'. '+
-  'Copia exactamente todos los decimales y unidades. No redondees. '+
-  'Devuelve SOLO JSON válido: {"fields":[{"field":"max_ac_current","value":"43.3","unit":"A","evidence":"texto visible exacto que identifica el dato","model_context":"'+(target||'')+'"}]}. '+
-  'Si algo es ambiguo, omítelo.';
+  'MODELO OBJETIVO: '+target+'. Revisa la imagen y estos candidatos. Para cada uno comprueba que el VALOR exacto pertenece inequívocamente al campo indicado para el modelo objetivo. '+
+  'Si una celda aparece una sola vez centrada o combinada y visualmente cubre toda la fila de modelos, puede aplicar a todos; en otro caso NO lo asumas. '+
+  'No aceptes un dato solo porque el número aparezca en la página. Devuelve SOLO JSON válido {"accepted":["v0","v2"]}. Candidatos: '+JSON.stringify(compact);
  try{
   const raw=await s.prompt([{role:'user',content:[{type:'text',value:prompt},{type:'image',value:blob}]}],{signal:state.controller.signal});
   const parsed=parseJsonLoose(raw);
-  return (Array.isArray(parsed.fields)?parsed.fields:[])
-   .filter(f=>f&&technicalFields.includes(f.field)&&typeof f.value==='string'&&typeof f.evidence==='string')
-   .map(f=>({...f,unit:f.unit||'',model_context:f.model_context||target||'',docName:c.docName,pageNumber:c.pageNumber,docRole:c.docRole,via:'visión',verification:verify(f.field,c.text,f.evidence,f.value)}));
+  return new Set(Array.isArray(parsed.accepted)?parsed.accepted:[]);
+ }catch(e){
+  state.aiErrors.push({docName:c.docName,pageNumber:c.pageNumber,name:e?.name||'Error',message:'Verificación visual: '+(e?.message||String(e))});
+  return new Set();
+ }
+}
+function shouldUseVision(c){
+ if(c.docRole==='ficha técnica')return true;
+ if(c.docRole!=='manual')return false;
+ const low=(c.text+' '+(c.layoutText||'')).toLowerCase();
+ return /cable|section|cross.?section|terminal|breaker|sección|seccion|borne|protecci/.test(low);
+}
+async function analyzePageVision(c){
+ const target=norm($('#model').value),s=await ensureVisionSession(),blob=await renderBlob(c);
+ const technicalFields=['rated_ac_power','max_apparent_power','nominal_ac_voltage','rated_ac_current','max_ac_current','frequency','power_factor','thdi','ac_connection'];
+ const manualFields=['ac_terminal_cable_range','recommended_ac_cable_section','minimum_ac_cable_section','maximum_ac_cable_section','recommended_ac_breaker','installation_condition'];
+ const allowed=c.docRole==='manual'?manualFields:technicalFields;
+ const sourceRule=c.docRole==='manual'
+  ? 'Este es un MANUAL: busca exclusivamente requisitos o recomendaciones de instalación (secciones de cable, rango de bornes, protecciones y condiciones). '
+  : 'Esta es una FICHA TÉCNICA: busca exclusivamente datos eléctricos del equipo. ';
+ const prompt=
+  sourceRule+
+  'MODELO OBJETIVO: '+target+'. Analiza VISUALMENTE la página completa. Debes interpretar filas, columnas, encabezados, celdas combinadas y notas. '+
+  'IMPORTANTE: algunos fabricantes escriben un valor una sola vez centrado en una fila para indicar que aplica a TODOS los modelos. En ese caso usa scope="all_models" solo si la disposición visual lo deja inequívocamente claro. '+
+  'Si el valor está en una columna concreta usa scope="selected_model" y solo extráelo si corresponde a '+target+'. '+
+  'Campos permitidos: '+allowed.join(', ')+'. Copia exactamente todos los decimales y símbolos; no calcules ni redondees. '+
+  'Devuelve SOLO JSON válido: {"fields":[{"field":"max_ac_current","value":"43.3","unit":"A","row_label":"Máx. corriente de salida a red (A)","scope":"selected_model"}]}. Si algo es ambiguo, omítelo.';
+ try{
+  const raw=await s.prompt([{role:'user',content:[{type:'text',value:prompt},{type:'image',value:blob}]}],{signal:state.controller.signal});
+  const parsed=parseJsonLoose(raw);
+  const candidates=(Array.isArray(parsed.fields)?parsed.fields:[])
+   .filter(f=>f&&allowed.includes(f.field)&&typeof f.value==='string'&&typeof f.row_label==='string')
+   .map(f=>({...f,unit:f.unit||'',scope:f.scope||'selected_model'}));
+  const accepted=await verifyVisualCandidates(c,candidates,blob,target);
+  return candidates.map((f,i)=>{
+   const local=visualLiteralCheck(c,f,target);
+   const visuallyAccepted=accepted.has('v'+i);
+   const ok=local.ok&&visuallyAccepted;
+   return {
+    ...f,evidence:(f.row_label||'')+' → '+f.value+(f.scope==='all_models'?' (valor común a todos los modelos)':''),
+    model_context:target,docName:c.docName,pageNumber:c.pageNumber,docRole:c.docRole,via:'visión · doble comprobación',
+    verification:{ok,reason:ok?local.reason:(!local.ok?local.reason:'La segunda pasada visual no confirmó inequívocamente la asociación con el modelo.')}
+   };
+  });
  }catch(e){
   state.aiErrors.push({docName:c.docName,pageNumber:c.pageNumber,name:e?.name||'Error',message:'Visión: '+(e?.message||String(e))});
   return [];
@@ -514,22 +573,12 @@ function renderResults(){
 }
 async function run(){
  state.controller=new AbortController();state.docs=[];state.pages=[];state.candidates=[];state.results=[];state.aiErrors=[];$('#cancel').classList.remove('hidden');$('#analyze').disabled=true;$('#resSec').classList.add('hidden');$('#candSec').classList.add('hidden');
- try{const sessionPromise=ensureSession();setProgress(2,'Preparando análisis','Inicializando la IA y leyendo documentos…');for(let i=0;i<state.files.length;i++){const r=await extractPdf(state.files[i],i);state.docs.push(r.doc);state.pages.push(...r.pages)}await sessionPromise;state.candidates=choosePages(state.pages,+$('#maxPages').value||6);if(!state.candidates.length)throw new Error('No se localizaron páginas técnicas candidatas.');renderCandidates();setProgress(53,'Páginas técnicas localizadas',state.candidates.length+' de '+state.pages.length+' páginas seleccionadas.');for(let i=0;i<state.candidates.length;i++){setProgress(56+38*i/state.candidates.length,'Analizando texto con Gemini Nano',(i+1)+'/'+state.candidates.length+' · '+state.candidates[i].docName+' · pág. '+state.candidates[i].pageNumber);state.results.push(...await analyzePage(state.candidates[i]))}
-// Segunda pasada visual solo en fichas técnicas que hayan producido pocos datos por texto.
-const techCandidates=state.candidates.filter(x=>x.docRole==='ficha técnica');
-for(const cand of techCandidates){
- const current=state.results.filter(r=>r.docName===cand.docName&&r.pageNumber===cand.pageNumber&&r.verification?.ok).length;
- const hasPhysicalColumn=!!extractTargetColumn(cand,norm($('#model').value));
- if(current<3&&!hasPhysicalColumn){
-  setProgress(94,'Refinando ficha sin columna detectable','Visión local · '+cand.docName+' · pág. '+cand.pageNumber);
-  state.results.push(...await analyzePageVision(cand));
- }
-}
+ try{const sessionPromise=ensureSession();setProgress(2,'Preparando análisis','Inicializando la IA y leyendo documentos…');for(let i=0;i<state.files.length;i++){const r=await extractPdf(state.files[i],i);state.docs.push(r.doc);state.pages.push(...r.pages)}await sessionPromise;state.candidates=choosePages(state.pages,+$('#maxPages').value||6);if(!state.candidates.length)throw new Error('No se localizaron páginas técnicas candidatas.');renderCandidates();setProgress(53,'Páginas técnicas localizadas',state.candidates.length+' de '+state.pages.length+' páginas seleccionadas.');for(let i=0;i<state.candidates.length;i++){setProgress(56+38*i/state.candidates.length,'Analizando páginas con Gemini Nano',(i+1)+'/'+state.candidates.length+' · '+state.candidates[i].docName+' · pág. '+state.candidates[i].pageNumber);state.results.push(...await analyzePage(state.candidates[i]))}
 setProgress(97,'Verificando evidencia','Comprobando fuente, significado, valor y eliminando duplicados…');state.results=consolidateResults(state.results);renderResults();setProgress(100,'Análisis terminado','La IA solo ha propuesto datos; la verificación y prioridad de fuentes se han aplicado aparte.')}
  catch(e){if(e.name==='AbortError')setProgress(0,'Análisis cancelado','');else{setProgress(0,'No se pudo completar el análisis',e.message||String(e));console.error(e)}}finally{$('#cancel').classList.add('hidden');state.controller=null;checkCompat()}
 }
 
-$('#files').onchange=e=>addFiles(e.target.files);$('#model').onchange=checkCompat;$('#refresh').onclick=checkCompat;$('#analyze').onclick=run;$('#cancel').onclick=()=>state.controller?.abort();$('#clear').onclick=()=>{state.files=[];state.docs=[];state.pages=[];state.candidates=[];state.results=[];state.models=[];state.modelDetectSeq++;try{state.session?.destroy()}catch{}try{state.visionSession?.destroy()}catch{}try{state.modelSession?.destroy()}catch{}state.session=null;state.visionSession=null;state.modelSession=null;$('#files').value='';renderModelOptions([]);$('#candSec').classList.add('hidden');$('#resSec').classList.add('hidden');$('#progress').classList.add('hidden');renderFiles();checkCompat()};
+$('#files').onchange=e=>addFiles(e.target.files);$('#model').onchange=checkCompat;$('#refresh').onclick=checkCompat;$('#analyze').onclick=run;$('#cancel').onclick=()=>state.controller?.abort();$('#clear').onclick=()=>{state.files=[];state.docs=[];state.pages=[];state.candidates=[];state.results=[];state.models=[];state.modelDetectSeq++;try{state.session?.destroy()}catch{}try{state.visionSession?.destroy()}catch{}try{state.visionVerifySession?.destroy()}catch{}try{state.modelSession?.destroy()}catch{}state.session=null;state.visionSession=null;state.visionVerifySession=null;state.modelSession=null;$('#files').value='';renderModelOptions([]);$('#candSec').classList.add('hidden');$('#resSec').classList.add('hidden');$('#progress').classList.add('hidden');renderFiles();checkCompat()};
 renderFiles();checkCompat();
 </script>
 </body>
