@@ -22,7 +22,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:9px 7px;border-bottom:1p
 <body>
 <main>
 <header class="top">
-<div><div class="eyebrow">FIVE Works · Proof of Concept</div><h1>Analizador documental FV con IA integrada en Chrome</h1><p class="lead">Prueba aislada para validar Gemini Nano antes de conectarlo al motor de cálculo de secciones.</p></div>
+<div><div class="eyebrow">FIVE Works · Proof of Concept</div><h1>Analizador documental FV con IA integrada en Chrome</h1><p class="lead">Prueba aislada para validar Gemini Nano antes de conectarlo al motor de cálculo de secciones. Ruta estable: texto primero; visión solo como reserva.</p></div>
 <div class="privacy">🔒 PDFs procesados localmente</div>
 </header>
 
@@ -53,7 +53,7 @@ import * as pdfjsLib from 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38
 pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs';
 
 const $=s=>document.querySelector(s);
-const state={files:[],docs:[],pages:[],candidates:[],results:[],session:null,controller:null};
+const state={files:[],docs:[],pages:[],candidates:[],results:[],aiErrors:[],session:null,controller:null};
 const keywords=[
  ['maximum ac output current',12],['max ac output current',12],['rated output current',11],['rated ac current',11],
  ['nominal output current',10],['output current',7],['rated output power',10],['rated ac power',10],['nominal ac power',10],
@@ -75,23 +75,46 @@ function renderFiles(){const el=$('#fileList');el.innerHTML=state.files.map((f,i
 function addFiles(list){for(const f of [...list]){if(state.files.length>=10)break;if((f.type==='application/pdf'||f.name.toLowerCase().endsWith('.pdf'))&&!state.files.some(x=>x.name===f.name&&x.size===f.size))state.files.push(f)}renderFiles();checkCompat()}
 
 async function checkCompat(){
- const secure=isSecureContext, api='LanguageModel' in globalThis; let av=api?'comprobando…':'no disponible',err='';
- if(api){try{av=await LanguageModel.availability({expectedInputs:[{type:'text',languages:['es','en']},{type:'image'}],expectedOutputs:[{type:'text',languages:['es']}]})}catch(e){av='error';err=e.message||String(e)}}
+ const secure=isSecureContext, api='LanguageModel' in globalThis; let textAv=api?'comprobando…':'no disponible',imageAv='—',err='';
+ if(api){
+  try{textAv=await LanguageModel.availability({expectedInputs:[{type:'text',languages:['es','en']}],expectedOutputs:[{type:'text',languages:['es']}]})}catch(e){textAv='error';err=e.message||String(e)}
+  try{imageAv=await LanguageModel.availability({expectedInputs:[{type:'text',languages:['es','en']},{type:'image'}],expectedOutputs:[{type:'text',languages:['es']}]})}catch(e){imageAv='error'}
+ }
  const m=navigator.userAgent.match(/Chrome\/(\d+)/),ver=m?+m[1]:null;
- const items=[['Contexto seguro',secure?'Sí':'No',secure?'ok':'bad'],['Chrome',ver?'v'+ver:'No detectado',ver>=148?'ok':'warn'],['Prompt API',api?'Detectada':'No detectada',api?'ok':'bad'],['Gemini Nano',av,av==='available'?'ok':(av==='downloadable'||av==='downloading')?'warn':'bad']];
+ const good=v=>v==='available', wait=v=>v==='downloadable'||v==='downloading';
+ const items=[['Contexto seguro',secure?'Sí':'No',secure?'ok':'bad'],['Chrome',ver?'v'+ver:'No detectado',ver>=148?'ok':'warn'],['Gemini Nano · texto',textAv,good(textAv)?'ok':wait(textAv)?'warn':'bad'],['Visión (reserva)',imageAv,good(imageAv)?'ok':wait(imageAv)?'warn':'bad']];
  $('#compat').innerHTML=items.map(x=>'<div class="metric '+x[2]+'"><small>'+esc(x[0])+'</small><b>'+esc(x[1])+'</b></div>').join('');
- let help=''; if(!secure)help='La Prompt API necesita contexto seguro HTTPS.';else if(!api)help='Chrome no expone LanguageModel. Comprueba que Chrome esté actualizado.';else if(av==='downloadable')help='Compatible. Al analizar, Chrome descargará el modelo local por primera vez.';else if(av==='downloading')help='Chrome está descargando el modelo local.';else if(av==='available')help='Todo listo: el modelo local está disponible.';else if(av==='unavailable')help='Este equipo/configuración no cumple los requisitos actuales de la Prompt API.';if(err)help+=' Detalle: '+err;
- $('#compatHelp').textContent=help;$('#compatHelp').classList.toggle('hidden',!help);$('#analyze').disabled=!state.files.length||!secure||!api||['unavailable','error'].includes(av);return av;
+ let help=''; if(!secure)help='La Prompt API necesita contexto seguro HTTPS.';else if(!api)help='Chrome no expone LanguageModel. Comprueba que Chrome esté actualizado.';else if(textAv==='downloadable')help='Compatible. Al analizar, Chrome descargará el modelo local por primera vez.';else if(textAv==='downloading')help='Chrome está descargando el modelo local.';else if(textAv==='available')help='Todo listo. La extracción usará primero texto; la visión queda como reserva para una fase posterior.';else if(textAv==='unavailable')help='Este equipo/configuración no cumple los requisitos actuales de la Prompt API.';if(err)help+=' Detalle: '+err;
+ $('#compatHelp').textContent=help;$('#compatHelp').classList.toggle('hidden',!help);$('#analyze').disabled=!state.files.length||!secure||!api||['unavailable','error'].includes(textAv);return textAv;
 }
 
 async function extractPdf(file,idx){
  const data=new Uint8Array(await file.arrayBuffer()),pdf=await pdfjsLib.getDocument({data}).promise,docId='d'+idx,rows=[];
- for(let p=1;p<=pdf.numPages;p++){if(state.controller.signal.aborted)throw new DOMException('Cancelado','AbortError');const page=await pdf.getPage(p),tc=await page.getTextContent(),text=norm(tc.items.map(x=>x.str).join(' '));rows.push({docId,docName:file.name,pageNumber:p,text});setProgress(15+35*((state.pages.length+p)/(Math.max(1,pdf.numPages*state.files.length))),'Leyendo PDFs',file.name+' · pág. '+p+'/'+pdf.numPages);page.cleanup()}
+ for(let p=1;p<=pdf.numPages;p++){if(state.controller.signal.aborted)throw new DOMException('Cancelado','AbortError');const page=await pdf.getPage(p),tc=await page.getTextContent(),text=norm(tc.items.map(x=>x.str).join(' '));rows.push({docId,docName:file.name,pageNumber:p,pageCount:pdf.numPages,text});setProgress(15+35*((state.pages.length+p)/(Math.max(1,pdf.numPages*state.files.length))),'Leyendo PDFs',file.name+' · pág. '+p+'/'+pdf.numPages);page.cleanup()}
  return {doc:{docId,file,pdf,name:file.name},pages:rows};
 }
 function choosePages(pages,max){
- const scored=pages.map(p=>{const low=p.text.toLowerCase();let score=0,h=[];for(const [k,w] of keywords)if(low.includes(k)){score+=w;h.push(k)}return {...p,score,hits:h}}).filter(x=>x.score>0).sort((a,b)=>b.score-a.score);
- const out=[];for(const s of scored){if(out.length>=max)break;if(!out.some(x=>x.docId===s.docId&&x.pageNumber===s.pageNumber))out.push(s)}return out;
+ const target=norm($('#model').value).toLowerCase();
+ const scored=pages.map(p=>{
+  const low=p.text.toLowerCase();let score=0,h=[];
+  for(const [k,w] of keywords)if(low.includes(k)){score+=w;h.push(k)}
+  if(target&&low.includes(target)){score+=80;h.unshift('modelo exacto: '+target)}
+  if(/datasheet|data sheet|technical data|technical parameters|specifica|especifica|specifications/.test(low)){score+=12}
+  if(p.pageCount<=12)score+=4;
+  return {...p,score,hits:h}
+ }).filter(x=>x.score>0).sort((a,b)=>b.score-a.score);
+ const out=[];
+ // Primero, la mejor página de cada documento para evitar que un manual largo monopolice la selección.
+ for(const docId of [...new Set(scored.map(x=>x.docId))]){
+  const best=scored.find(x=>x.docId===docId);
+  if(best&&out.length<max)out.push(best);
+ }
+ // Después, completar por puntuación global.
+ for(const s of scored){
+  if(out.length>=max)break;
+  if(!out.some(x=>x.docId===s.docId&&x.pageNumber===s.pageNumber))out.push(s);
+ }
+ return out.sort((a,b)=>b.score-a.score);
 }
 async function renderBlob(c){const d=state.docs.find(x=>x.docId===c.docId),p=await d.pdf.getPage(c.pageNumber),vp0=p.getViewport({scale:1}),scale=Math.min(1.8,Math.max(1,1150/vp0.width)),vp=p.getViewport({scale}),canvas=document.createElement('canvas');canvas.width=Math.floor(vp.width);canvas.height=Math.floor(vp.height);await p.render({canvasContext:canvas.getContext('2d',{alpha:false}),viewport:vp}).promise;const blob=await new Promise((r,j)=>canvas.toBlob(b=>b?r(b):j(new Error('No se pudo renderizar la página')),'image/jpeg',.82));p.cleanup();return blob}
 function numberTokens(s){return (String(s).match(/[-+]?\d+(?:[.,]\d+)?/g)||[]).map(x=>x.replace(',','.'))}
@@ -104,27 +127,51 @@ function verify(pageText,evidence,value){
 async function ensureSession(){
  if(state.session)return state.session;
  state.session=await LanguageModel.create({
-  expectedInputs:[{type:'text',languages:['es','en']},{type:'image'}],expectedOutputs:[{type:'text',languages:['es']}],
-  initialPrompts:[{role:'system',content:'Eres un extractor técnico extremadamente conservador. Solo extrae hechos explícitos de la página aportada. No estimes, no calcules, no conviertas unidades, no completes por conocimiento previo. Si hay varios modelos en una tabla, no mezcles columnas. evidence debe ser una cita breve y literal que contenga o identifique el valor. Si un dato no aparece inequívocamente, omítelo.'}],
+  expectedInputs:[{type:'text',languages:['es','en']}],
+  expectedOutputs:[{type:'text',languages:['es']}],
+  initialPrompts:[{role:'system',content:'Eres un extractor técnico extremadamente conservador. Solo extrae hechos explícitos del texto aportado. No estimes, no calcules, no conviertas unidades y no completes por conocimiento previo. Si hay varios modelos en una tabla, no mezcles columnas. Si un dato no aparece inequívocamente, omítelo.'}],
   signal:state.controller.signal,
   monitor(m){m.addEventListener('downloadprogress',e=>{const p=Math.round((e.total?e.loaded/e.total:e.loaded)*100);setProgress(Math.min(15,p*.15),'Preparando Gemini Nano','Descarga del modelo: '+p+'%')})}
  });return state.session;
 }
+function parseJsonLoose(raw){
+ const cleaned=String(raw||'').replace(/\`\`\`json/gi,'').replace(/\`\`\`/g,'').trim();
+ try{return JSON.parse(cleaned)}catch{}
+ const a=cleaned.indexOf('{'),b=cleaned.lastIndexOf('}');
+ if(a>=0&&b>a)return JSON.parse(cleaned.slice(a,b+1));
+ throw new Error('Gemini respondió, pero no devolvió JSON válido.');
+}
 async function analyzePage(c){
- const s=await ensureSession(),blob=await renderBlob(c),target=norm($('#model').value);
- const prompt='Documento: '+c.docName+'\nPágina: '+c.pageNumber+'\n'+(target?'MODELO OBJETIVO: '+target+'. Extrae solo valores inequívocamente asociados a este modelo.\n':'')+'Busca únicamente: fabricante, modelo, potencia nominal AC, potencia aparente máxima, tensión nominal AC, corriente nominal AC, corriente máxima AC, frecuencia, factor de potencia, THDi, conexión AC y rango admisible de cable en terminal AC.\n\nTexto extraído de la página:\n'+c.text.slice(0,12000)+'\n\nTambién recibes una imagen de la misma página para reconstruir tablas. Omite cualquier campo ambiguo.';
- const raw=await s.prompt([{role:'user',content:[{type:'text',value:prompt},{type:'image',value:blob}]}],{responseConstraint:schema,signal:state.controller.signal});const parsed=JSON.parse(raw);
- return (parsed.fields||[]).map(f=>({...f,docName:c.docName,pageNumber:c.pageNumber,verification:verify(c.text,f.evidence,f.value)}));
+ const s=await ensureSession(),target=norm($('#model').value);
+ const allowed=fields.map(x=>x[0]).join(', ');
+ const prompt=
+  'Documento: '+c.docName+'\nPágina: '+c.pageNumber+'\n'+
+  (target?'MODELO OBJETIVO: '+target+'. Si hay una tabla con varios modelos, usa EXCLUSIVAMENTE la columna de este modelo.\n':'')+
+  'Extrae únicamente hechos que estén EXPLÍCITOS en el texto. No infieras ni calcules nada. '+
+  'Campos permitidos: '+allowed+'.\n'+
+  'Devuelve SOLO JSON válido con esta forma exacta: {"fields":[{"field":"max_ac_current","value":"43.3","unit":"A","evidence":"fragmento literal corto del texto","model_context":"GW25K-ET"}]}. '+
+  'Si no hay datos inequívocos, devuelve {"fields":[]}. evidence debe copiar literalmente una parte del texto que permita verificar el valor.\n\n'+
+  'TEXTO DE LA PÁGINA:\n'+c.text.slice(0,7500);
+ try{
+  const raw=await s.prompt(prompt,{signal:state.controller.signal});
+  const parsed=parseJsonLoose(raw);
+  return (Array.isArray(parsed.fields)?parsed.fields:[])
+   .filter(f=>f&&fields.some(x=>x[0]===f.field)&&typeof f.value==='string'&&typeof f.evidence==='string')
+   .map(f=>({...f,unit:f.unit||'',model_context:f.model_context||'',docName:c.docName,pageNumber:c.pageNumber,verification:verify(c.text,f.evidence,f.value)}));
+ }catch(e){
+  state.aiErrors.push({docName:c.docName,pageNumber:c.pageNumber,name:e?.name||'Error',message:e?.message||String(e)});
+  return [];
+ }
 }
 function renderCandidates(){const el=$('#cand');el.innerHTML=state.candidates.map(c=>'<div class="candidate"><div><b>'+esc(c.docName)+' · pág. '+c.pageNumber+'</b><div class="muted">'+esc(c.hits.slice(0,5).join(' · '))+'</div></div><span class="score">score '+c.score+'</span></div>').join('');$('#candSec').classList.remove('hidden')}
 function renderResults(){
- const label=Object.fromEntries(fields),verified=state.results.filter(x=>x.verification.ok).length;$('#summary').innerHTML='<b>'+verified+' campos verificados</b> · '+(state.results.length-verified)+' requieren revisión. Gemini Nano recibió '+state.candidates.length+' de '+state.pages.length+' páginas revisadas localmente.';
+ const label=Object.fromEntries(fields),verified=state.results.filter(x=>x.verification.ok).length;$('#summary').innerHTML='<b>'+verified+' campos verificados</b> · '+(state.results.length-verified)+' requieren revisión. Gemini Nano recibió '+state.candidates.length+' de '+state.pages.length+' páginas revisadas localmente.'+(state.aiErrors.length?' <b>'+state.aiErrors.length+' página(s) dieron error de IA y se omitieron sin inventar datos.</b>':'');
  const rows=state.results.map(x=>'<tr><td>'+esc(label[x.field]||x.field)+'</td><td><b>'+esc(x.value)+' '+esc(x.unit)+'</b></td><td>'+esc(x.model_context||'—')+'</td><td><span class="pill '+(x.verification.ok?'verified':'review')+'">'+(x.verification.ok?'Verificado':'Revisión')+'</span></td><td>'+esc(x.docName)+' · pág. '+x.pageNumber+'</td><td class="evidence">“'+esc(x.evidence)+'”<br><span class="muted">'+esc(x.verification.reason)+'</span></td></tr>').join('');
  $('#results').innerHTML=rows?'<table><thead><tr><th>Campo</th><th>Valor</th><th>Modelo</th><th>Estado</th><th>Fuente</th><th>Evidencia</th></tr></thead><tbody>'+rows+'</tbody></table>':'<div class="notice">No se obtuvo ningún dato verificable. El sistema no rellena valores por inferencia.</div>';$('#raw').textContent=JSON.stringify(state.results,null,2);$('#resSec').classList.remove('hidden')
 }
 async function run(){
- state.controller=new AbortController();state.docs=[];state.pages=[];state.candidates=[];state.results=[];$('#cancel').classList.remove('hidden');$('#analyze').disabled=true;$('#resSec').classList.add('hidden');$('#candSec').classList.add('hidden');
- try{const sessionPromise=ensureSession();setProgress(2,'Preparando análisis','Inicializando la IA y leyendo documentos…');for(let i=0;i<state.files.length;i++){const r=await extractPdf(state.files[i],i);state.docs.push(r.doc);state.pages.push(...r.pages)}await sessionPromise;state.candidates=choosePages(state.pages,+$('#maxPages').value||6);if(!state.candidates.length)throw new Error('No se localizaron páginas técnicas candidatas.');renderCandidates();setProgress(53,'Páginas técnicas localizadas',state.candidates.length+' de '+state.pages.length+' páginas seleccionadas.');for(let i=0;i<state.candidates.length;i++){setProgress(56+38*i/state.candidates.length,'Analizando con Gemini Nano',(i+1)+'/'+state.candidates.length+' · '+state.candidates[i].docName+' · pág. '+state.candidates[i].pageNumber);state.results.push(...await analyzePage(state.candidates[i]))}setProgress(97,'Verificando evidencia','Comprobando que cada valor pueda sostenerse en el PDF original…');renderResults();setProgress(100,'Análisis terminado','La IA solo ha propuesto datos; la verificación se ha hecho aparte.')}
+ state.controller=new AbortController();state.docs=[];state.pages=[];state.candidates=[];state.results=[];state.aiErrors=[];$('#cancel').classList.remove('hidden');$('#analyze').disabled=true;$('#resSec').classList.add('hidden');$('#candSec').classList.add('hidden');
+ try{const sessionPromise=ensureSession();setProgress(2,'Preparando análisis','Inicializando la IA y leyendo documentos…');for(let i=0;i<state.files.length;i++){const r=await extractPdf(state.files[i],i);state.docs.push(r.doc);state.pages.push(...r.pages)}await sessionPromise;state.candidates=choosePages(state.pages,+$('#maxPages').value||6);if(!state.candidates.length)throw new Error('No se localizaron páginas técnicas candidatas.');renderCandidates();setProgress(53,'Páginas técnicas localizadas',state.candidates.length+' de '+state.pages.length+' páginas seleccionadas.');for(let i=0;i<state.candidates.length;i++){setProgress(56+38*i/state.candidates.length,'Analizando texto con Gemini Nano',(i+1)+'/'+state.candidates.length+' · '+state.candidates[i].docName+' · pág. '+state.candidates[i].pageNumber);state.results.push(...await analyzePage(state.candidates[i]))}setProgress(97,'Verificando evidencia','Comprobando que cada valor pueda sostenerse en el PDF original…');renderResults();setProgress(100,'Análisis terminado','La IA solo ha propuesto datos; la verificación se ha hecho aparte.')}
  catch(e){if(e.name==='AbortError')setProgress(0,'Análisis cancelado','');else{setProgress(0,'No se pudo completar el análisis',e.message||String(e));console.error(e)}}finally{$('#cancel').classList.add('hidden');state.controller=null;checkCompat()}
 }
 
