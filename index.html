@@ -45,7 +45,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:9px 7px;border-bottom:1p
 
 <section class="card hidden" id="candSec"><div class="head"><div><h2>3. Páginas seleccionadas</h2><p>Selección determinista previa a la IA. Las páginas relevantes se renderizan como imagen para que Gemini interprete tablas, celdas combinadas y valores comunes a varios modelos.</p></div></div><div id="cand" class="candidates"></div></section>
 
-<section class="card hidden" id="resSec"><div class="head"><div><h2>4. Datos extraídos</h2><p>Política de fuentes: ficha técnica → datos eléctricos; manual → criterios/recomendaciones de instalación. Las tablas se interpretan visualmente y después se verifican contra el texto original del PDF. Número, significado y unidad/dimensión deben quedar demostrados antes de aceptar un dato.</p></div></div><div id="summary" class="notice"></div><div id="results"></div><details><summary>Ver salida técnica</summary><pre id="raw"></pre></details></section>
+<section class="card hidden" id="resSec"><div class="head"><div><h2>4. Datos extraídos</h2><p>Política de fuentes: ficha técnica → datos eléctricos; manual → criterios/recomendaciones de instalación. Las tablas se interpretan visualmente con reintento automático y después se verifican contra el texto original del PDF. Número, significado y unidad/dimensión deben quedar demostrados antes de aceptar un dato.</p></div></div><div id="summary" class="notice"></div><div id="results"></div><details><summary>Ver salida técnica</summary><pre id="raw"></pre></details></section>
 </main>
 
 <script type="module">
@@ -196,7 +196,7 @@ async function checkCompat(){
  }
  const m=navigator.userAgent.match(/Chrome\/(\d+)/),ver=m?+m[1]:null;
  const good=v=>v==='available', wait=v=>v==='downloadable'||v==='downloading';
- const items=[['Contexto seguro',secure?'Sí':'No',secure?'ok':'bad'],['Chrome',ver?'v'+ver:'No detectado',ver>=148?'ok':'warn'],['Gemini Nano · texto',textAv,good(textAv)?'ok':wait(textAv)?'warn':'bad'],['Visión (reserva)',imageAv,good(imageAv)?'ok':wait(imageAv)?'warn':'bad']];
+ const items=[['Contexto seguro',secure?'Sí':'No',secure?'ok':'bad'],['Chrome',ver?'v'+ver:'No detectado',ver>=148?'ok':'warn'],['Gemini Nano · texto',textAv,good(textAv)?'ok':wait(textAv)?'warn':'bad'],['Visión',imageAv,good(imageAv)?'ok':wait(imageAv)?'warn':'bad']];
  $('#compat').innerHTML=items.map(x=>'<div class="metric '+x[2]+'"><small>'+esc(x[0])+'</small><b>'+esc(x[1])+'</b></div>').join('');
  let help=''; if(!secure)help='La Prompt API necesita contexto seguro HTTPS.';else if(!api)help='Chrome no expone LanguageModel. Comprueba que Chrome esté actualizado.';else if(textAv==='downloadable')help='Compatible. Al analizar, Chrome descargará el modelo local por primera vez.';else if(textAv==='downloading')help='Chrome está descargando el modelo local.';else if(textAv==='available')help='Todo listo. El texto localizará páginas relevantes y la visión analizará las tablas; después se hará una verificación independiente.';else if(textAv==='unavailable')help='Este equipo/configuración no cumple los requisitos actuales de la Prompt API.';if(err)help+=' Detalle: '+err;
  $('#compatHelp').textContent=help;$('#compatHelp').classList.toggle('hidden',!help);const needsModel=state.models.length>1&&!$('#model').value;$('#analyze').disabled=!state.files.length||!secure||!api||['unavailable','error'].includes(textAv)||needsModel;return textAv;
@@ -395,12 +395,44 @@ async function ensureSession(){
   monitor(m){m.addEventListener('downloadprogress',e=>{const p=Math.round((e.total?e.loaded/e.total:e.loaded)*100);setProgress(Math.min(15,p*.15),'Preparando Gemini Nano','Descarga del modelo: '+p+'%')})}
  });return state.session;
 }
+function repairJsonText(s){
+ let x=String(s||'')
+  .replace(/\`\`\`json/gi,'')
+  .replace(/\`\`\`/g,'')
+  .trim()
+  .replace(/[“”]/g,'"')
+  .replace(/[‘’]/g,"'");
+ const a=x.indexOf('{'),b=x.lastIndexOf('}');
+ if(a>=0&&b>a)x=x.slice(a,b+1);
+ // Gemini Nano a veces escribe secuencias como \², \>, \<, etc. dentro de strings.
+ // En JSON son escapes inválidos: las convertimos en barras literales.
+ x=x.replace(/\\(?!["\\\/bfnrtu])/g,'\\\\');
+ // Comas finales frecuentes en JSON generado.
+ x=x.replace(/,\s*([}\]])/g,'$1');
+ return x;
+}
 function parseJsonLoose(raw){
  const cleaned=String(raw||'').replace(/\`\`\`json/gi,'').replace(/\`\`\`/g,'').trim();
- try{return JSON.parse(cleaned)}catch{}
- const a=cleaned.indexOf('{'),b=cleaned.lastIndexOf('}');
- if(a>=0&&b>a)return JSON.parse(cleaned.slice(a,b+1));
- throw new Error('Gemini respondió, pero no devolvió JSON válido.');
+ try{return JSON.parse(cleaned)}catch(firstErr){}
+ const repaired=repairJsonText(cleaned);
+ try{return JSON.parse(repaired)}catch(secondErr){
+  const err=new SyntaxError('Gemini devolvió JSON no reparable: '+secondErr.message);
+  err.rawPreview=cleaned.slice(0,500);
+  throw err;
+ }
+}
+function parseVisualLines(raw,allowed){
+ const out=[];
+ for(const original of String(raw||'').split(/\r?\n/)){
+  const line=original.trim().replace(/^[-*•]\s*/,'');
+  if(!line||!line.includes('|'))continue;
+  const parts=line.split('|').map(x=>x.trim());
+  if(parts.length<5)continue;
+  const [field,value,unit,row_label,scope]=parts;
+  if(!allowed.includes(field)||!value||!row_label)continue;
+  out.push({field,value,unit:unit||'',row_label,scope:scope==='all_models'?'all_models':'selected_model'});
+ }
+ return out;
 }
 
 async function analyzeDatasheetColumn(c){
@@ -535,10 +567,17 @@ async function verifyVisualCandidates(c,candidates,blob,target){
   'No aceptes un dato solo porque el número aparezca en la página. Comprueba también la UNIDAD/DIMENSIÓN: sección de cable requiere mm²/mm2/AWG; breaker/corriente requiere A; tensión requiere V. Si la unidad no está visualmente explícita, rechaza. Devuelve SOLO JSON válido {"accepted":["v0","v2"]}. Candidatos: '+JSON.stringify(compact);
  try{
   const raw=await s.prompt([{role:'user',content:[{type:'text',value:prompt},{type:'image',value:blob}]}],{signal:state.controller.signal});
-  const parsed=parseJsonLoose(raw);
-  return new Set(Array.isArray(parsed.accepted)?parsed.accepted:[]);
+  try{
+   const parsed=parseJsonLoose(raw);
+   return new Set(Array.isArray(parsed.accepted)?parsed.accepted:[]);
+  }catch(jsonErr){
+   // Si el revisor devuelve texto simple, recuperamos únicamente IDs explícitos v0, v1...
+   const ids=[...String(raw||'').matchAll(/\bv\d+\b/g)].map(m=>m[0]);
+   if(ids.length)return new Set(ids);
+   throw jsonErr;
+  }
  }catch(e){
-  state.aiErrors.push({docName:c.docName,pageNumber:c.pageNumber,name:e?.name||'Error',message:'Verificación visual: '+(e?.message||String(e))});
+  state.aiErrors.push({docName:c.docName,pageNumber:c.pageNumber,name:e?.name||'Error',message:'Verificación visual: '+(e?.message||String(e)),rawPreview:e?.rawPreview||''});
   return new Set();
  }
 }
@@ -547,6 +586,42 @@ function shouldUseVision(c){
  if(c.docRole!=='manual')return false;
  const low=(c.text+' '+(c.layoutText||'')).toLowerCase();
  return /cable|section|cross.?section|terminal|breaker|sección|seccion|borne|protecci/.test(low);
+}
+
+async function extractVisualCandidatesWithRetry(s,c,blob,target,allowed,sourceRule){
+ const base=
+  sourceRule+
+  'MODELO OBJETIVO: '+target+'. Analiza VISUALMENTE la página completa. Debes interpretar filas, columnas, encabezados, celdas combinadas y notas. '+
+  'Algunos fabricantes escriben un valor una sola vez centrado en una fila para indicar que aplica a TODOS los modelos: usa scope="all_models" solo si la disposición visual lo demuestra claramente. '+
+  'Si el valor está en una columna concreta usa scope="selected_model" y solo extráelo si corresponde a '+target+'. '+
+  'Campos permitidos: '+allowed.join(', ')+'. Copia exactamente decimales, signos y símbolos. La unidad debe estar explícita; nunca la infieras. ';
+ const firstPrompt=base+
+  'Devuelve SOLO JSON válido, sin markdown ni barras invertidas innecesarias: {"fields":[{"field":"max_ac_current","value":"43.3","unit":"A","row_label":"Máx. corriente de salida a red (A)","scope":"selected_model"}]}. Si algo es ambiguo, omítelo.';
+ let raw='';
+ try{
+  raw=await s.prompt([{role:'user',content:[{type:'text',value:firstPrompt},{type:'image',value:blob}]}],{signal:state.controller.signal});
+  const parsed=parseJsonLoose(raw);
+  return (Array.isArray(parsed.fields)?parsed.fields:[])
+   .filter(f=>f&&allowed.includes(f.field)&&typeof f.value==='string'&&typeof f.row_label==='string')
+   .map(f=>({...f,unit:f.unit||'',scope:f.scope==='all_models'?'all_models':'selected_model'}));
+ }catch(firstErr){
+  // Reintento sin JSON: formato delimitado mucho más tolerante.
+  const retryPrompt=base+
+   'El formato JSON anterior no fue válido. Esta vez NO uses JSON. Devuelve una línea por dato y nada más, exactamente: FIELD|VALUE|UNIT|ROW_LABEL|SCOPE. '+
+   'FIELD debe ser uno de: '+allowed.join(', ')+'. SCOPE solo selected_model o all_models. No uses el carácter | dentro de ROW_LABEL.';
+  try{
+   const raw2=await s.prompt([{role:'user',content:[{type:'text',value:retryPrompt},{type:'image',value:blob}]}],{signal:state.controller.signal});
+   const parsed2=parseVisualLines(raw2,allowed);
+   if(parsed2.length)return parsed2;
+   const e=new Error('El reintento visual respondió, pero no produjo registros válidos.');
+   e.rawPreview=String(raw2||'').slice(0,500);
+   throw e;
+  }catch(secondErr){
+   const err=new Error('Fallaron JSON y formato alternativo. JSON: '+(firstErr?.message||firstErr)+' · Alternativo: '+(secondErr?.message||secondErr));
+   err.rawPreview=(firstErr?.rawPreview||String(raw||'').slice(0,300));
+   throw err;
+  }
+ }
 }
 async function analyzePageVision(c){
  const target=norm($('#model').value),s=await ensureVisionSession(),blob=await renderBlob(c);
@@ -564,11 +639,7 @@ async function analyzePageVision(c){
   'Campos permitidos: '+allowed.join(', ')+'. Copia exactamente todos los decimales y símbolos; no calcules ni redondees. La unidad solo puede devolverse si aparece explícitamente junto al valor o en la cabecera/etiqueta de la misma fila/columna. NUNCA conviertas A en mm² ni infieras unidades. '+
   'Devuelve SOLO JSON válido: {"fields":[{"field":"max_ac_current","value":"43.3","unit":"A","row_label":"Máx. corriente de salida a red (A)","scope":"selected_model"}]}. Si algo es ambiguo, omítelo.';
  try{
-  const raw=await s.prompt([{role:'user',content:[{type:'text',value:prompt},{type:'image',value:blob}]}],{signal:state.controller.signal});
-  const parsed=parseJsonLoose(raw);
-  const candidates=(Array.isArray(parsed.fields)?parsed.fields:[])
-   .filter(f=>f&&allowed.includes(f.field)&&typeof f.value==='string'&&typeof f.row_label==='string')
-   .map(f=>({...f,unit:f.unit||'',scope:f.scope||'selected_model'}));
+  const candidates=await extractVisualCandidatesWithRetry(s,c,blob,target,allowed,sourceRule);
   const accepted=await verifyVisualCandidates(c,candidates,blob,target);
   return candidates.map((f,i)=>{
    const local=visualLiteralCheck(c,f,target);
@@ -581,7 +652,7 @@ async function analyzePageVision(c){
    };
   });
  }catch(e){
-  state.aiErrors.push({docName:c.docName,pageNumber:c.pageNumber,name:e?.name||'Error',message:'Visión: '+(e?.message||String(e))});
+  state.aiErrors.push({docName:c.docName,pageNumber:c.pageNumber,name:e?.name||'Error',message:'Visión: '+(e?.message||String(e)),rawPreview:e?.rawPreview||''});
   return [];
  }
 }
