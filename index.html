@@ -45,7 +45,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:9px 7px;border-bottom:1p
 
 <section class="card hidden" id="candSec"><div class="head"><div><h2>3. Páginas seleccionadas</h2><p>Selección determinista previa a la IA. Las páginas relevantes se renderizan como imagen para que Gemini interprete tablas, celdas combinadas y valores comunes a varios modelos.</p></div></div><div id="cand" class="candidates"></div></section>
 
-<section class="card hidden" id="resSec"><div class="head"><div><h2>4. Datos extraídos</h2><p>Política de fuentes: ficha técnica → datos eléctricos; manual → criterios/recomendaciones de instalación. Las tablas se interpretan visualmente y después se verifican contra el texto original del PDF antes de aceptar un dato.</p></div></div><div id="summary" class="notice"></div><div id="results"></div><details><summary>Ver salida técnica</summary><pre id="raw"></pre></details></section>
+<section class="card hidden" id="resSec"><div class="head"><div><h2>4. Datos extraídos</h2><p>Política de fuentes: ficha técnica → datos eléctricos; manual → criterios/recomendaciones de instalación. Las tablas se interpretan visualmente y después se verifican contra el texto original del PDF. Número, significado y unidad/dimensión deben quedar demostrados antes de aceptar un dato.</p></div></div><div id="summary" class="notice"></div><div id="results"></div><details><summary>Ver salida técnica</summary><pre id="raw"></pre></details></section>
 </main>
 
 <script type="module">
@@ -352,14 +352,38 @@ function semanticMatch(field,evidence){
  if(field==='recommended_ac_breaker') return /(breaker|circuit breaker|magnetotérmico|magnetotermico|protección|proteccion)/.test(e);
  return true;
 }
+
+function unitCompatible(field,value,evidence,unit=''){
+ const s=(norm(value)+' '+norm(unit)+' '+norm(evidence)).toLowerCase();
+ const hasA=/(^|[^a-z])[-+]?\d+(?:[.,]\d+)?\s*a\b/.test(s)||/ampere|amperio/.test(s);
+ const hasV=/(^|[^a-z])[-+]?\d+(?:[.,]\d+)?\s*v\b/.test(s)||/volt/.test(s);
+ const hasW=/\b(?:kw|w|kva|va)\b/.test(s);
+ const hasHz=/\bhz\b|hertz/.test(s);
+ const hasArea=/mm\s*(?:²|2|\^2)|awg|cross.?section|sección\s+(?:del\s+)?(?:cable|conductor)|seccion\s+(?:del\s+)?(?:cable|conductor)/.test(s);
+ if(['recommended_ac_cable_section','minimum_ac_cable_section','maximum_ac_cable_section','ac_terminal_cable_range'].includes(field)) return hasArea&&!hasA;
+ if(['rated_ac_current','max_ac_current','recommended_ac_breaker'].includes(field)) return hasA;
+ if(field==='nominal_ac_voltage') return hasV;
+ if(['rated_ac_power','max_apparent_power'].includes(field)) return hasW;
+ if(field==='frequency') return hasHz;
+ return true;
+}
+function normalizedValueUnit(value,unit,evidence){
+ const ev=norm(evidence);
+ const val=norm(value);
+ const u=norm(unit);
+ // No añadir unidades inferidas. Si la unidad no aparece en value/unit/evidence, se conserva vacía.
+ return {value:val,unit:u,evidence:ev};
+}
 function verify(field,pageText,evidence,value){
  const pt=norm(pageText).toLowerCase(),ev=norm(evidence).toLowerCase(); if(!ev||ev.length<4)return {ok:false,reason:'Sin evidencia utilizable'};
  const words=ev.split(' ').filter(w=>w.length>3);const overlap=words.length?words.filter(w=>pt.includes(w)).length/words.length:0;
  const numeric=exactNumericMatch(value,evidence);
  const semantic=semanticMatch(field,ev);
+ const units=unitCompatible(field,value,evidence,'');
  if(!semantic)return {ok:false,reason:'La evidencia no corresponde semánticamente con el campo ('+field+').' };
  if(!numeric)return {ok:false,reason:'El valor numérico no coincide exactamente con la evidencia; no se permiten redondeos ni truncados.'};
- return overlap>=0.55&&numeric?{ok:true,reason:'Evidencia, valor y significado corroborados en la página'}:{ok:false,reason:'La evidencia o el valor no se corroboran suficientemente'};
+ if(!units)return {ok:false,reason:'La dimensión/unidad de la evidencia no es compatible con el campo; no se permiten unidades inferidas.'};
+ return overlap>=0.55&&numeric?{ok:true,reason:'Evidencia, valor, significado y dimensión corroborados en la página'}:{ok:false,reason:'La evidencia o el valor no se corroboran suficientemente'};
 }
 async function ensureSession(){
  if(state.session)return state.session;
@@ -491,12 +515,15 @@ async function ensureVisionVerifySession(){
 function visualLiteralCheck(c,f,target){
  const page=norm(c.text).toLowerCase();
  const valueOk=numberTokens(f.value).length ? exactNumericMatch(f.value,c.text) : page.includes(norm(f.value).toLowerCase());
+ const evidence=(f.row_label||f.evidence||'')+' '+(f.value||'')+' '+(f.unit||'');
  const semantic=semanticMatch(f.field,f.row_label||f.evidence||'');
+ const units=unitCompatible(f.field,f.value,evidence,f.unit||'');
  const modelOk=!target||page.includes(norm(target).toLowerCase());
  if(!valueOk)return {ok:false,reason:'El valor exacto propuesto no aparece en el texto original de la página.'};
  if(!semantic)return {ok:false,reason:'La etiqueta visual no corresponde semánticamente con el campo.'};
+ if(!units)return {ok:false,reason:'La unidad/dimensión no está demostrada para este campo (por ejemplo, sección exige mm²/AWG y protección exige A).'};
  if(!modelOk)return {ok:false,reason:'El modelo seleccionado no aparece en el texto original de la página.'};
- return {ok:true,reason:'Valor exacto y etiqueta corroborados contra el PDF; asociación modelo/valor confirmada en dos pasadas visuales.'};
+ return {ok:true,reason:'Valor exacto, etiqueta y dimensión corroborados contra el PDF; asociación modelo/valor confirmada en dos pasadas visuales.'};
 }
 async function verifyVisualCandidates(c,candidates,blob,target){
  if(!candidates.length)return new Set();
@@ -505,7 +532,7 @@ async function verifyVisualCandidates(c,candidates,blob,target){
  const prompt=
   'MODELO OBJETIVO: '+target+'. Revisa la imagen y estos candidatos. Para cada uno comprueba que el VALOR exacto pertenece inequívocamente al campo indicado para el modelo objetivo. '+
   'Si una celda aparece una sola vez centrada o combinada y visualmente cubre toda la fila de modelos, puede aplicar a todos; en otro caso NO lo asumas. '+
-  'No aceptes un dato solo porque el número aparezca en la página. Devuelve SOLO JSON válido {"accepted":["v0","v2"]}. Candidatos: '+JSON.stringify(compact);
+  'No aceptes un dato solo porque el número aparezca en la página. Comprueba también la UNIDAD/DIMENSIÓN: sección de cable requiere mm²/mm2/AWG; breaker/corriente requiere A; tensión requiere V. Si la unidad no está visualmente explícita, rechaza. Devuelve SOLO JSON válido {"accepted":["v0","v2"]}. Candidatos: '+JSON.stringify(compact);
  try{
   const raw=await s.prompt([{role:'user',content:[{type:'text',value:prompt},{type:'image',value:blob}]}],{signal:state.controller.signal});
   const parsed=parseJsonLoose(raw);
@@ -534,7 +561,7 @@ async function analyzePageVision(c){
   'MODELO OBJETIVO: '+target+'. Analiza VISUALMENTE la página completa. Debes interpretar filas, columnas, encabezados, celdas combinadas y notas. '+
   'IMPORTANTE: algunos fabricantes escriben un valor una sola vez centrado en una fila para indicar que aplica a TODOS los modelos. En ese caso usa scope="all_models" solo si la disposición visual lo deja inequívocamente claro. '+
   'Si el valor está en una columna concreta usa scope="selected_model" y solo extráelo si corresponde a '+target+'. '+
-  'Campos permitidos: '+allowed.join(', ')+'. Copia exactamente todos los decimales y símbolos; no calcules ni redondees. '+
+  'Campos permitidos: '+allowed.join(', ')+'. Copia exactamente todos los decimales y símbolos; no calcules ni redondees. La unidad solo puede devolverse si aparece explícitamente junto al valor o en la cabecera/etiqueta de la misma fila/columna. NUNCA conviertas A en mm² ni infieras unidades. '+
   'Devuelve SOLO JSON válido: {"fields":[{"field":"max_ac_current","value":"43.3","unit":"A","row_label":"Máx. corriente de salida a red (A)","scope":"selected_model"}]}. Si algo es ambiguo, omítelo.';
  try{
   const raw=await s.prompt([{role:'user',content:[{type:'text',value:prompt},{type:'image',value:blob}]}],{signal:state.controller.signal});
@@ -548,7 +575,7 @@ async function analyzePageVision(c){
    const visuallyAccepted=accepted.has('v'+i);
    const ok=local.ok&&visuallyAccepted;
    return {
-    ...f,evidence:(f.row_label||'')+' → '+f.value+(f.scope==='all_models'?' (valor común a todos los modelos)':''),
+    ...f,evidence:(f.row_label||'')+' → '+f.value+(f.unit?' '+f.unit:'')+(f.scope==='all_models'?' (valor común a todos los modelos)':''),
     model_context:target,docName:c.docName,pageNumber:c.pageNumber,docRole:c.docRole,via:'visión · doble comprobación',
     verification:{ok,reason:ok?local.reason:(!local.ok?local.reason:'La segunda pasada visual no confirmó inequívocamente la asociación con el modelo.')}
    };
