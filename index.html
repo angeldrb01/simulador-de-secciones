@@ -36,7 +36,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:9px 7px;border-bottom:1p
 <label class="drop"><input id="files" type="file" multiple accept=".pdf,application/pdf"><strong>Arrastra o selecciona fichas y manuales</strong><span>máximo 10 archivos PDF</span></label>
 <div id="fileList" class="files"></div>
 <div class="row">
-<label><span>Modelo objetivo (opcional)</span><input id="model" placeholder="Ej.: GW100K-ET-G10"></label>
+<label><span>Equipo / modelo detectado</span><select id="model" disabled><option value="">Añade documentación para detectar modelos</option></select><small id="modelStatus" class="muted">La detección se hará automáticamente al añadir los PDFs.</small></label>
 <label><span>Máximo de páginas para IA</span><select id="maxPages"><option>4</option><option selected>6</option><option>8</option><option>10</option></select></label>
 </div>
 <div class="actions"><button class="btn primary" id="analyze" disabled>Analizar documentación</button><button class="btn danger hidden" id="cancel">Cancelar</button><button class="btn secondary" id="clear">Limpiar</button></div>
@@ -53,7 +53,7 @@ import * as pdfjsLib from 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38
 pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs';
 
 const $=s=>document.querySelector(s);
-const state={files:[],docs:[],pages:[],candidates:[],results:[],aiErrors:[],session:null,visionSession:null,controller:null};
+const state={files:[],docs:[],pages:[],candidates:[],results:[],aiErrors:[],models:[],modelSession:null,modelDetectSeq:0,session:null,visionSession:null,controller:null};
 const keywords=[
  ['maximum ac output current',12],['max ac output current',12],['rated output current',11],['rated ac current',11],
  ['nominal output current',10],['output current',7],['rated output power',10],['rated ac power',10],['nominal ac power',10],
@@ -76,9 +76,118 @@ const schema={type:'object',additionalProperties:false,properties:{fields:{type:
 function esc(s=''){return String(s).replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
 function norm(s=''){return String(s).normalize('NFKC').replace(/\s+/g,' ').trim()}
 function setProgress(p,t,d=''){p=Math.max(0,Math.min(100,Math.round(p)));$('#progress').classList.remove('hidden');$('#pp').textContent=p+'%';$('#bar').style.width=p+'%';$('#pt').textContent=t;$('#pd').textContent=d}
-function renderFiles(){const el=$('#fileList');el.innerHTML=state.files.map((f,i)=>'<div class="file"><div><b>'+esc(f.name)+'</b><div class="muted">'+(f.size/1048576).toFixed(1)+' MB</div></div><button class="btn secondary" data-i="'+i+'">Quitar</button></div>').join('');el.querySelectorAll('button').forEach(b=>b.onclick=()=>{state.files.splice(+b.dataset.i,1);renderFiles();checkCompat()})}
-function addFiles(list){for(const f of [...list]){if(state.files.length>=10)break;if((f.type==='application/pdf'||f.name.toLowerCase().endsWith('.pdf'))&&!state.files.some(x=>x.name===f.name&&x.size===f.size))state.files.push(f)}renderFiles();checkCompat()}
+function renderFiles(){
+ const el=$('#fileList');
+ el.innerHTML=state.files.map((f,i)=>'<div class="file"><div><b>'+esc(f.name)+'</b><div class="muted">'+(f.size/1048576).toFixed(1)+' MB</div></div><button class="btn secondary" data-i="'+i+'">Quitar</button></div>').join('');
+ el.querySelectorAll('button').forEach(b=>b.onclick=()=>{state.files.splice(+b.dataset.i,1);renderFiles();renderModelOptions([]);checkCompat();detectModelsFromFiles()})
+}
+function addFiles(list){
+ for(const f of [...list]){
+  if(state.files.length>=10)break;
+  if((f.type==='application/pdf'||f.name.toLowerCase().endsWith('.pdf'))&&!state.files.some(x=>x.name===f.name&&x.size===f.size))state.files.push(f)
+ }
+ renderFiles();checkCompat();detectModelsFromFiles();
+}
 
+
+function normalizeModelCode(s=''){
+ return norm(s).replace(/[,:;]+$/,'').replace(/^[-–—]+|[-–—]+$/g,'').trim();
+}
+function plausibleModelCode(s=''){
+ const x=normalizeModelCode(s);
+ if(x.length<4||x.length>40||/^(19|20)\d{2}$/.test(x))return false;
+ if(!/[A-Za-z]/.test(x)||!/[0-9]/.test(x))return false;
+ if(/^(IEC|EN|DIN|ISO|IP|CE|AC|DC|PDF|VDE|IEEE)[-_]?\d/i.test(x))return false;
+ return true;
+}
+function deterministicModelCandidates(text){
+ const counts=new Map();
+ const add=(v,w=1)=>{const x=normalizeModelCode(v);if(plausibleModelCode(x))counts.set(x,(counts.get(x)||0)+w)};
+ const labelRx=/(?:model(?:\s+name|\s+no\.?|\s+number)?|modelo|type)\s*[:：]?\s*([A-Za-z0-9][A-Za-z0-9._+\/-]{3,39})/gi;
+ for(const m of text.matchAll(labelRx))add(m[1],8);
+ const tokenRx=/\b[A-Za-z][A-Za-z0-9]{1,20}(?:[-_/][A-Za-z0-9.+]{1,20})+\b/g;
+ for(const m of text.matchAll(tokenRx))add(m[0],2);
+ const looseRx=/\b(?=[A-Za-z0-9._+-]{5,30}\b)(?=[A-Za-z0-9._+-]*[A-Za-z])(?=[A-Za-z0-9._+-]*\d)[A-Za-z][A-Za-z0-9._+-]{4,29}\b/g;
+ for(const m of text.matchAll(looseRx))add(m[0],1);
+ return [...counts.entries()].sort((a,b)=>b[1]-a[1]).slice(0,40).map(([model,score])=>({model,score}));
+}
+async function previewDocument(file){
+ const data=new Uint8Array(await file.arrayBuffer()),pdf=await pdfjsLib.getDocument({data}).promise;
+ const pageNums=pdf.numPages<=18?[...Array(pdf.numPages)].map((_,i)=>i+1):[1,2,3,4,5,6,7,8,9,10,pdf.numPages];
+ const parts=[];
+ for(const n of [...new Set(pageNums)]){
+  const p=await pdf.getPage(n),tc=await p.getTextContent(),text=norm(tc.items.map(x=>x.str).join(' '));
+  parts.push('['+file.name+' · pág. '+n+'] '+text);p.cleanup();
+ }
+ try{await pdf.destroy()}catch{}
+ return parts.join('\n');
+}
+async function ensureModelSession(){
+ if(state.modelSession)return state.modelSession;
+ state.modelSession=await LanguageModel.create({
+  expectedInputs:[{type:'text',languages:['es','en']}],
+  expectedOutputs:[{type:'text',languages:['es']}],
+  initialPrompts:[{role:'system',content:'Identificas exclusivamente fabricantes, tipos de equipos eléctricos y códigos de modelo que aparezcan explícitamente en documentación técnica. No inventes ni completes nombres. Un modelo debe ser un código o denominación visible en el texto.'}]
+ });
+ return state.modelSession;
+}
+function renderModelOptions(models,status=''){
+ state.models=models||[];
+ const sel=$('#model'),previous=sel.value;
+ if(!state.files.length){
+  sel.innerHTML='<option value="">Añade documentación para detectar modelos</option>';sel.disabled=true;
+  $('#modelStatus').textContent='La detección se hará automáticamente al añadir los PDFs.';return;
+ }
+ if(!state.models.length){
+  sel.innerHTML='<option value="">No se ha identificado un modelo inequívoco</option>';sel.disabled=false;
+  $('#modelStatus').textContent=status||'Puedes analizar sin fijar modelo, pero las tablas con varias variantes quedarán más limitadas.';return;
+ }
+ sel.innerHTML=(state.models.length>1?'<option value="">Selecciona un modelo…</option>':'')+state.models.map(x=>'<option value="'+esc(x.model)+'">'+esc((x.manufacturer?x.manufacturer+' · ':'')+x.model+(x.equipment_type?' · '+x.equipment_type:''))+'</option>').join('');
+ sel.disabled=false;
+ if(state.models.length===1)sel.value=state.models[0].model;
+ else if(state.models.some(x=>x.model===previous))sel.value=previous;
+ $('#modelStatus').textContent=status||((state.models.length===1)?'Modelo identificado automáticamente.':'Se han detectado '+state.models.length+' modelos. Selecciona el equipo que corresponde al tramo.');
+}
+async function detectModelsFromFiles(){
+ const seq=++state.modelDetectSeq;
+ if(!state.files.length){renderModelOptions([]);return}
+ const sel=$('#model');sel.disabled=true;sel.innerHTML='<option>Detectando modelos…</option>';
+ $('#modelStatus').textContent='Leyendo la documentación localmente…';
+ try{
+  const previews=[];
+  for(const file of state.files){if(seq!==state.modelDetectSeq)return;previews.push(await previewDocument(file))}
+  if(seq!==state.modelDetectSeq)return;
+  const combined=previews.join('\n').slice(0,28000);
+  const deterministic=deterministicModelCandidates(combined);
+  let models=[];
+  try{
+   $('#modelStatus').textContent='Gemini Nano está depurando los modelos encontrados…';
+   const s=await ensureModelSession();
+   const prompt=
+    'A partir del texto técnico siguiente, devuelve SOLO JSON válido con la forma '+ 
+    '{"models":[{"manufacturer":"GoodWe","model":"GW25K-ET","equipment_type":"inversor"}]}. '+
+    'equipment_type puede ser inversor, batería, PCS, cargador, contador, transformador, otro. '+
+    'Incluye únicamente modelos que aparezcan literalmente en el texto. No incluyas normas, tensiones, códigos de certificación, versiones de firmware ni números de pieza accesorios. '+
+    'Si una ficha contiene una familia con varios modelos, devuelve todos los modelos explícitos. '+
+    'Candidatos detectados por reglas locales: '+deterministic.slice(0,25).map(x=>x.model).join(', ')+'.\n\nDOCUMENTACIÓN:\n'+combined;
+   const raw=await s.prompt(prompt);
+   const parsed=parseJsonLoose(raw);
+   models=(Array.isArray(parsed.models)?parsed.models:[])
+    .map(x=>({manufacturer:norm(x.manufacturer||''),model:normalizeModelCode(x.model||''),equipment_type:norm(x.equipment_type||'')}))
+    .filter(x=>plausibleModelCode(x.model));
+  }catch(e){
+   models=deterministic.slice(0,12).map(x=>({manufacturer:'',model:x.model,equipment_type:''}));
+  }
+  const unique=new Map();
+  for(const x of models){const k=x.model.toLowerCase();if(!unique.has(k))unique.set(k,x)}
+  models=[...unique.values()];
+  if(seq!==state.modelDetectSeq)return;
+  renderModelOptions(models,models.length?'Modelos detectados a partir de los documentos; no se han generado manualmente.':'No se ha localizado ningún modelo con suficiente claridad.');
+ }catch(e){
+  if(seq!==state.modelDetectSeq)return;
+  renderModelOptions([],'No se pudo completar la detección automática: '+(e?.message||String(e)));
+ }
+}
 async function checkCompat(){
  const secure=isSecureContext, api='LanguageModel' in globalThis; let textAv=api?'comprobando…':'no disponible',imageAv='—',err='';
  if(api){
@@ -90,7 +199,7 @@ async function checkCompat(){
  const items=[['Contexto seguro',secure?'Sí':'No',secure?'ok':'bad'],['Chrome',ver?'v'+ver:'No detectado',ver>=148?'ok':'warn'],['Gemini Nano · texto',textAv,good(textAv)?'ok':wait(textAv)?'warn':'bad'],['Visión (reserva)',imageAv,good(imageAv)?'ok':wait(imageAv)?'warn':'bad']];
  $('#compat').innerHTML=items.map(x=>'<div class="metric '+x[2]+'"><small>'+esc(x[0])+'</small><b>'+esc(x[1])+'</b></div>').join('');
  let help=''; if(!secure)help='La Prompt API necesita contexto seguro HTTPS.';else if(!api)help='Chrome no expone LanguageModel. Comprueba que Chrome esté actualizado.';else if(textAv==='downloadable')help='Compatible. Al analizar, Chrome descargará el modelo local por primera vez.';else if(textAv==='downloading')help='Chrome está descargando el modelo local.';else if(textAv==='available')help='Todo listo. La extracción usará primero texto; la visión queda como reserva para una fase posterior.';else if(textAv==='unavailable')help='Este equipo/configuración no cumple los requisitos actuales de la Prompt API.';if(err)help+=' Detalle: '+err;
- $('#compatHelp').textContent=help;$('#compatHelp').classList.toggle('hidden',!help);$('#analyze').disabled=!state.files.length||!secure||!api||['unavailable','error'].includes(textAv);return textAv;
+ $('#compatHelp').textContent=help;$('#compatHelp').classList.toggle('hidden',!help);const needsModel=state.models.length>1&&!$('#model').value;$('#analyze').disabled=!state.files.length||!secure||!api||['unavailable','error'].includes(textAv)||needsModel;return textAv;
 }
 
 async function extractPdf(file,idx){
@@ -285,7 +394,7 @@ setProgress(97,'Verificando evidencia','Comprobando fuente, significado, valor y
  catch(e){if(e.name==='AbortError')setProgress(0,'Análisis cancelado','');else{setProgress(0,'No se pudo completar el análisis',e.message||String(e));console.error(e)}}finally{$('#cancel').classList.add('hidden');state.controller=null;checkCompat()}
 }
 
-$('#files').onchange=e=>addFiles(e.target.files);$('#refresh').onclick=checkCompat;$('#analyze').onclick=run;$('#cancel').onclick=()=>state.controller?.abort();$('#clear').onclick=()=>{state.files=[];state.docs=[];state.pages=[];state.candidates=[];state.results=[];try{state.session?.destroy()}catch{}try{state.visionSession?.destroy()}catch{}state.session=null;state.visionSession=null;$('#files').value='';$('#candSec').classList.add('hidden');$('#resSec').classList.add('hidden');$('#progress').classList.add('hidden');renderFiles();checkCompat()};
+$('#files').onchange=e=>addFiles(e.target.files);$('#model').onchange=checkCompat;$('#refresh').onclick=checkCompat;$('#analyze').onclick=run;$('#cancel').onclick=()=>state.controller?.abort();$('#clear').onclick=()=>{state.files=[];state.docs=[];state.pages=[];state.candidates=[];state.results=[];state.models=[];state.modelDetectSeq++;try{state.session?.destroy()}catch{}try{state.visionSession?.destroy()}catch{}try{state.modelSession?.destroy()}catch{}state.session=null;state.visionSession=null;state.modelSession=null;$('#files').value='';renderModelOptions([]);$('#candSec').classList.add('hidden');$('#resSec').classList.add('hidden');$('#progress').classList.add('hidden');renderFiles();checkCompat()};
 renderFiles();checkCompat();
 </script>
 </body>
