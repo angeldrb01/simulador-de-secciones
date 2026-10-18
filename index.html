@@ -22,7 +22,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:9px 7px;border-bottom:1p
 <body>
 <main>
 <header class="top">
-<div><div class="eyebrow">FIVE Works · Proof of Concept</div><h1>Analizador documental FV con IA integrada en Chrome</h1><p class="lead">Prueba aislada para validar Gemini Nano antes de conectarlo al motor de cálculo de secciones. Ruta estable: texto primero; visión solo como reserva.</p></div>
+<div><div class="eyebrow">FIVE Works · Proof of Concept</div><h1>Analizador documental FV con IA integrada en Chrome</h1><p class="lead">Prueba aislada para validar Gemini Nano antes de conectarlo al motor de cálculo de secciones. La ficha técnica aporta los datos eléctricos; los manuales aportan criterios y recomendaciones de instalación.</p></div>
 <div class="privacy">🔒 PDFs procesados localmente</div>
 </header>
 
@@ -32,7 +32,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:9px 7px;border-bottom:1p
 </section>
 
 <section class="card">
-<div class="head"><div><h2>2. Documentación</h2><p>Hasta 10 PDFs. El navegador revisa todas las páginas y solo manda a Gemini Nano las más relevantes.</p></div></div>
+<div class="head"><div><h2>2. Documentación</h2><p>Hasta 10 PDFs. El navegador distingue ficha técnica, manual y otros documentos. La ficha técnica se prioriza para datos eléctricos y el manual para secciones, bornes, protecciones y condiciones de instalación.</p></div></div>
 <label class="drop"><input id="files" type="file" multiple accept=".pdf,application/pdf"><strong>Arrastra o selecciona fichas y manuales</strong><span>máximo 10 archivos PDF</span></label>
 <div id="fileList" class="files"></div>
 <div class="row">
@@ -45,7 +45,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:9px 7px;border-bottom:1p
 
 <section class="card hidden" id="candSec"><div class="head"><div><h2>3. Páginas seleccionadas</h2><p>Selección determinista previa a la IA.</p></div></div><div id="cand" class="candidates"></div></section>
 
-<section class="card hidden" id="resSec"><div class="head"><div><h2>4. Datos técnicos extraídos</h2><p>Un dato solo se acepta si su valor y evidencia pueden corroborarse contra el texto de la página.</p></div></div><div id="summary" class="notice"></div><div id="results"></div><details><summary>Ver salida técnica</summary><pre id="raw"></pre></details></section>
+<section class="card hidden" id="resSec"><div class="head"><div><h2>4. Datos extraídos</h2><p>Política de fuentes: ficha técnica → datos eléctricos; manual → criterios/recomendaciones de instalación. Un dato solo se acepta si su valor y evidencia pueden corroborarse contra el texto de la página.</p></div></div><div id="summary" class="notice"></div><div id="results"></div><details><summary>Ver salida técnica</summary><pre id="raw"></pre></details></section>
 </main>
 
 <script type="module">
@@ -59,12 +59,17 @@ const keywords=[
  ['nominal output current',10],['output current',7],['rated output power',10],['rated ac power',10],['nominal ac power',10],
  ['grid voltage',9],['nominal voltage',8],['rated voltage',8],['power factor',7],['thdi',9],['total harmonic distortion',9],
  ['technical data',8],['technical parameters',8],['specifications',6],['ac connection',7],['ac terminal',8],['cable',4],
- ['max. ac output current',12],['corriente máxima',12],['corriente nominal',11],['potencia nominal',9],['tensión nominal',9]
+ ['max. ac output current',12],['corriente máxima',12],['corriente nominal',11],['potencia nominal',9],['tensión nominal',9],
+ ['recommended cable',14],['recommended cable size',16],['cable cross section',15],['cross-sectional area',15],['conductor cross section',15],
+ ['minimum cross section',16],['maximum cross section',16],['cable size',10],['terminal range',12],['ac terminal',10],['circuit breaker',10],['recommended breaker',14],
+ ['sección recomendada',16],['sección mínima',16],['sección máxima',16],['sección de cable',14],['rango de cable',12],['magnetotérmico',10],['protección recomendada',14]
 ];
 const fields=[
  ['manufacturer','Fabricante'],['model','Modelo'],['rated_ac_power','Potencia nominal AC'],['max_apparent_power','Potencia aparente máxima'],
  ['nominal_ac_voltage','Tensión nominal AC'],['rated_ac_current','Corriente nominal AC'],['max_ac_current','Corriente máxima AC'],
- ['frequency','Frecuencia'],['power_factor','Factor de potencia'],['thdi','THDi'],['ac_connection','Conexión AC'],['ac_terminal_cable_range','Rango cable terminal AC']
+ ['frequency','Frecuencia'],['power_factor','Factor de potencia'],['thdi','THDi'],['ac_connection','Conexión AC'],['ac_terminal_cable_range','Rango cable terminal AC'],
+ ['recommended_ac_cable_section','Sección AC recomendada'],['minimum_ac_cable_section','Sección AC mínima'],['maximum_ac_cable_section','Sección AC máxima'],
+ ['recommended_ac_breaker','Protección AC recomendada'],['installation_condition','Condición / regla de instalación']
 ];
 const schema={type:'object',additionalProperties:false,properties:{fields:{type:'array',items:{type:'object',additionalProperties:false,properties:{field:{type:'string',enum:fields.map(x=>x[0])},value:{type:'string'},unit:{type:'string'},evidence:{type:'string'},model_context:{type:'string'}},required:['field','value','unit','evidence','model_context']}}},required:['fields']};
 
@@ -91,7 +96,14 @@ async function checkCompat(){
 async function extractPdf(file,idx){
  const data=new Uint8Array(await file.arrayBuffer()),pdf=await pdfjsLib.getDocument({data}).promise,docId='d'+idx,rows=[];
  for(let p=1;p<=pdf.numPages;p++){if(state.controller.signal.aborted)throw new DOMException('Cancelado','AbortError');const page=await pdf.getPage(p),tc=await page.getTextContent(),text=norm(tc.items.map(x=>x.str).join(' '));rows.push({docId,docName:file.name,pageNumber:p,pageCount:pdf.numPages,text});setProgress(15+35*((state.pages.length+p)/(Math.max(1,pdf.numPages*state.files.length))),'Leyendo PDFs',file.name+' · pág. '+p+'/'+pdf.numPages);page.cleanup()}
- return {doc:{docId,file,pdf,name:file.name},pages:rows};
+ const sample=(rows.slice(0,Math.min(10,rows.length)).map(x=>x.text).join(' ')+' '+file.name).toLowerCase();
+ let role='otro';
+ const datasheetHits=(sample.match(/datasheet|data sheet|technical data|technical specifications|specifications|ficha técnica|datos técnicos/g)||[]).length;
+ const manualHits=(sample.match(/installation manual|user manual|operating manual|manual de instalación|manual de usuario|installation|commissioning|wiring/g)||[]).length;
+ if((datasheetHits>manualHits && rows.length<=30)||(/datasheet|data sheet|ficha técnica/.test(sample)&&rows.length<=40)) role='ficha técnica';
+ else if(manualHits>0||rows.length>40) role='manual';
+ rows.forEach(r=>r.docRole=role);
+ return {doc:{docId,file,pdf,name:file.name,role},pages:rows};
 }
 function choosePages(pages,max){
  const target=norm($('#model').value).toLowerCase();
@@ -99,6 +111,12 @@ function choosePages(pages,max){
   const low=p.text.toLowerCase();let score=0,h=[];
   for(const [k,w] of keywords)if(low.includes(k)){score+=w;h.push(k)}
   if(target&&low.includes(target)){score+=80;h.unshift('modelo exacto: '+target)}
+  if(p.docRole==='ficha técnica'){
+   if(/maximum ac output current|max ac output current|rated output current|rated ac current|rated output power|rated ac power|grid voltage|nominal voltage|power factor|thdi|technical data|specifications/.test(low)){score+=35;h.unshift('prioridad ficha técnica')}
+  }
+  if(p.docRole==='manual'){
+   if(/recommended cable|cable cross section|cross-sectional area|minimum cross section|maximum cross section|cable size|terminal|circuit breaker|recommended breaker|sección recomendada|sección mínima|sección máxima|sección de cable|protección recomendada/.test(low)){score+=35;h.unshift('prioridad manual')}
+  }
   if(/datasheet|data sheet|technical data|technical parameters|specifica|especifica|specifications/.test(low)){score+=12}
   if(p.pageCount<=12)score+=4;
   return {...p,score,hits:h}
@@ -143,10 +161,18 @@ function parseJsonLoose(raw){
 }
 async function analyzePage(c){
  const s=await ensureSession(),target=norm($('#model').value);
- const allowed=fields.map(x=>x[0]).join(', ');
+ const technicalFields=['manufacturer','model','rated_ac_power','max_apparent_power','nominal_ac_voltage','rated_ac_current','max_ac_current','frequency','power_factor','thdi','ac_connection'];
+ const manualFields=['ac_terminal_cable_range','recommended_ac_cable_section','minimum_ac_cable_section','maximum_ac_cable_section','recommended_ac_breaker','installation_condition'];
+ const allowed=(c.docRole==='manual'?manualFields:(c.docRole==='ficha técnica'?technicalFields:[...technicalFields,...manualFields])).join(', ');
+ const sourceInstruction=c.docRole==='manual'
+  ? 'Este documento es un MANUAL. Prioriza requisitos y recomendaciones de instalación: secciones recomendadas/mínimas/máximas, rango de bornes, protecciones y condiciones asociadas. No uses el manual como fuente principal de datos nominales si no es necesario. '
+  : (c.docRole==='ficha técnica'
+     ? 'Este documento es una FICHA TÉCNICA. Prioriza datos eléctricos nominales y máximos del equipo. No inventes recomendaciones de instalación que no aparezcan. '
+     : 'El tipo documental no está claro; extrae solo hechos inequívocos. ');
  const prompt=
-  'Documento: '+c.docName+'\nPágina: '+c.pageNumber+'\n'+
+  'Documento: '+c.docName+'\nTipo documental: '+c.docRole+'\nPágina: '+c.pageNumber+'\n'+
   (target?'MODELO OBJETIVO: '+target+'. Si hay una tabla con varios modelos, usa EXCLUSIVAMENTE la columna de este modelo.\n':'')+
+  sourceInstruction+
   'Extrae únicamente hechos que estén EXPLÍCITOS en el texto. No infieras ni calcules nada. '+
   'Campos permitidos: '+allowed+'.\n'+
   'Devuelve SOLO JSON válido con esta forma exacta: {"fields":[{"field":"max_ac_current","value":"43.3","unit":"A","evidence":"fragmento literal corto del texto","model_context":"GW25K-ET"}]}. '+
@@ -163,7 +189,7 @@ async function analyzePage(c){
   return [];
  }
 }
-function renderCandidates(){const el=$('#cand');el.innerHTML=state.candidates.map(c=>'<div class="candidate"><div><b>'+esc(c.docName)+' · pág. '+c.pageNumber+'</b><div class="muted">'+esc(c.hits.slice(0,5).join(' · '))+'</div></div><span class="score">score '+c.score+'</span></div>').join('');$('#candSec').classList.remove('hidden')}
+function renderCandidates(){const el=$('#cand');el.innerHTML=state.candidates.map(c=>'<div class="candidate"><div><b>'+esc(c.docName)+' · pág. '+c.pageNumber+'</b><div class="muted">'+esc(c.docRole||'otro')+' · '+esc(c.hits.slice(0,5).join(' · '))+'</div></div><span class="score">score '+c.score+'</span></div>').join('');$('#candSec').classList.remove('hidden')}
 function renderResults(){
  const label=Object.fromEntries(fields),verified=state.results.filter(x=>x.verification.ok).length;$('#summary').innerHTML='<b>'+verified+' campos verificados</b> · '+(state.results.length-verified)+' requieren revisión. Gemini Nano recibió '+state.candidates.length+' de '+state.pages.length+' páginas revisadas localmente.'+(state.aiErrors.length?' <b>'+state.aiErrors.length+' página(s) dieron error de IA y se omitieron sin inventar datos.</b>':'');
  const rows=state.results.map(x=>'<tr><td>'+esc(label[x.field]||x.field)+'</td><td><b>'+esc(x.value)+' '+esc(x.unit)+'</b></td><td>'+esc(x.model_context||'—')+'</td><td><span class="pill '+(x.verification.ok?'verified':'review')+'">'+(x.verification.ok?'Verificado':'Revisión')+'</span></td><td>'+esc(x.docName)+' · pág. '+x.pageNumber+'</td><td class="evidence">“'+esc(x.evidence)+'”<br><span class="muted">'+esc(x.verification.reason)+'</span></td></tr>').join('');
