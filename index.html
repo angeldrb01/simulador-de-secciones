@@ -45,7 +45,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:9px 7px;border-bottom:1p
 
 <section class="card hidden" id="candSec"><div class="head"><div><h2>3. Páginas seleccionadas</h2><p>Selección determinista previa a la IA. En fichas técnicas se reconstruyen filas y columnas antes del análisis para preservar las tablas.</p></div></div><div id="cand" class="candidates"></div></section>
 
-<section class="card hidden" id="resSec"><div class="head"><div><h2>4. Datos extraídos</h2><p>Política de fuentes: ficha técnica → datos eléctricos; manual → criterios/recomendaciones de instalación. Un dato solo se acepta si su valor y evidencia pueden corroborarse contra el texto de la página.</p></div></div><div id="summary" class="notice"></div><div id="results"></div><details><summary>Ver salida técnica</summary><pre id="raw"></pre></details></section>
+<section class="card hidden" id="resSec"><div class="head"><div><h2>4. Datos extraídos</h2><p>Política de fuentes: ficha técnica → datos eléctricos; manual → criterios/recomendaciones de instalación. En tablas multi-modelo, el valor se toma de la columna física del modelo seleccionado; la IA solo clasifica el significado de la fila.</p></div></div><div id="summary" class="notice"></div><div id="results"></div><details><summary>Ver salida técnica</summary><pre id="raw"></pre></details></section>
 </main>
 
 <script type="module">
@@ -203,20 +203,23 @@ async function checkCompat(){
 }
 
 
-function buildLayoutText(items){
+function buildLayoutRows(items){
  const cells=(items||[])
   .filter(it=>it&&typeof it.str==='string'&&it.str.trim())
-  .map(it=>({text:it.str.trim(),x:Number(it.transform?.[4]||0),y:Number(it.transform?.[5]||0),w:Number(it.width||0)}));
+  .map(it=>({text:it.str.trim(),x:Number(it.transform?.[4]||0),y:Number(it.transform?.[5]||0),w:Number(it.width||0),h:Math.abs(Number(it.transform?.[3]||0))}));
  cells.sort((a,b)=>Math.abs(b.y-a.y)>2.2?b.y-a.y:a.x-b.x);
  const rows=[];
  for(const cell of cells){
-  let row=rows.find(r=>Math.abs(r.y-cell.y)<=2.2);
+  let row=rows.find(r=>Math.abs(r.y-cell.y)<=Math.max(2.2,Math.min(4,(cell.h||2)*0.35)));
   if(!row){row={y:cell.y,cells:[]};rows.push(row)}
   row.cells.push(cell);
  }
  rows.sort((a,b)=>b.y-a.y);
- return rows.map(r=>{
-  r.cells.sort((a,b)=>a.x-b.x);
+ rows.forEach(r=>r.cells.sort((a,b)=>a.x-b.x));
+ return rows;
+}
+function layoutRowsToText(rows){
+ return (rows||[]).map(r=>{
   let line='',lastEnd=null;
   for(const cell of r.cells){
    if(lastEnd!==null){
@@ -226,8 +229,52 @@ function buildLayoutText(items){
    line+=cell.text;
    lastEnd=cell.x+Math.max(cell.w,cell.text.length*3);
   }
-  return norm(line);
+  return line.trim();
  }).filter(Boolean).join('\n');
+}
+function cellCenter(c){return c.x+Math.max(0,c.w)/2}
+function sameModel(a,b){return normalizeModelCode(a).toLowerCase()===normalizeModelCode(b).toLowerCase()}
+function extractTargetColumn(page,target){
+ const rows=page.layoutRows||[];
+ if(!target||!rows.length)return null;
+ let header=null,targetCell=null;
+ for(const r of rows){
+  const exact=r.cells.find(c=>sameModel(c.text,target));
+  if(exact){header=r;targetCell=exact;break}
+  for(let i=0;i<r.cells.length-1;i++){
+   const joined=normalizeModelCode(r.cells[i].text+r.cells[i+1].text);
+   if(sameModel(joined,target)){header=r;targetCell={text:joined,x:r.cells[i].x,y:r.y,w:(r.cells[i+1].x+r.cells[i+1].w)-r.cells[i].x};break}
+  }
+  if(header)break;
+ }
+ if(!header||!targetCell)return null;
+ const modelCells=header.cells.filter(c=>plausibleModelCode(c.text));
+ if(!modelCells.length)return null;
+ modelCells.sort((a,b)=>cellCenter(a)-cellCenter(b));
+ const firstModelX=cellCenter(modelCells[0]);
+ const targetX=cellCenter(targetCell);
+ const spacings=modelCells.slice(1).map((m,i)=>cellCenter(m)-cellCenter(modelCells[i])).filter(x=>x>5);
+ const avgSpacing=spacings.length?spacings.reduce((a,b)=>a+b,0)/spacings.length:70;
+ const tolerance=Math.max(18,avgSpacing*0.48);
+ const out=[];
+ let started=false;
+ for(const r of rows){
+  if(r===header){started=true;continue}
+  if(!started)continue;
+  const left=r.cells.filter(c=>cellCenter(c)<firstModelX-tolerance*0.45);
+  const right=r.cells.filter(c=>cellCenter(c)>=firstModelX-tolerance*0.45);
+  if(!left.length||!right.length)continue;
+  const label=norm(left.map(c=>c.text).join(' '));
+  if(!label||label.length<2)continue;
+  const candidates=right.map(c=>({c,d:Math.abs(cellCenter(c)-targetX)})).sort((a,b)=>a.d-b.d);
+  if(!candidates.length||candidates[0].d>tolerance)continue;
+  const chosen=candidates[0].c;
+  const value=norm(chosen.text);
+  if(!value||value===target)continue;
+  const rowText=norm(r.cells.map(c=>c.text).join(' '));
+  out.push({id:'r'+out.length,label,value,rowText,targetX,valueX:cellCenter(chosen),distance:candidates[0].d});
+ }
+ return out.length?{target,headerText:norm(header.cells.map(c=>c.text).join(' ')),targetX,firstModelX,rows:out}:null;
 }
 async function extractPdf(file,idx){
  const data=new Uint8Array(await file.arrayBuffer()),pdf=await pdfjsLib.getDocument({data}).promise,docId='d'+idx,rows=[];
@@ -235,8 +282,9 @@ async function extractPdf(file,idx){
   if(state.controller.signal.aborted)throw new DOMException('Cancelado','AbortError');
   const page=await pdf.getPage(p),tc=await page.getTextContent();
   const text=norm(tc.items.map(x=>x.str).join(' '));
-  const layoutText=buildLayoutText(tc.items);
-  rows.push({docId,docName:file.name,pageNumber:p,pageCount:pdf.numPages,text,layoutText});
+  const layoutRows=buildLayoutRows(tc.items);
+  const layoutText=layoutRowsToText(layoutRows);
+  rows.push({docId,docName:file.name,pageNumber:p,pageCount:pdf.numPages,text,layoutText,layoutRows});
   setProgress(15+35*((state.pages.length+p)/(Math.max(1,pdf.numPages*state.files.length))),'Leyendo PDFs',file.name+' · pág. '+p+'/'+pdf.numPages);
   page.cleanup()
 }
@@ -330,8 +378,50 @@ function parseJsonLoose(raw){
  if(a>=0&&b>a)return JSON.parse(cleaned.slice(a,b+1));
  throw new Error('Gemini respondió, pero no devolvió JSON válido.');
 }
+
+async function analyzeDatasheetColumn(c){
+ const target=norm($('#model').value);
+ const col=extractTargetColumn(c,target);
+ if(!col)return null;
+ const s=await ensureSession();
+ const technicalFields=['rated_ac_power','max_apparent_power','nominal_ac_voltage','rated_ac_current','max_ac_current','frequency','power_factor','thdi','ac_connection'];
+ const rows=col.rows.slice(0,80);
+ const prompt=
+  'Has recibido filas ya extraídas DETERMINÍSTICAMENTE de la columna del modelo '+target+'. '+
+  'NO debes elegir, cambiar, redondear ni inventar valores. Solo clasifica el significado de cada etiqueta de fila. '+
+  'Campos permitidos: '+technicalFields.join(', ')+'. '+
+  'Devuelve SOLO JSON válido: {"mappings":[{"row_id":"r3","field":"max_ac_current"}]}. '+
+  'Omite filas ambiguas. No asignes el mismo row_id a más de un campo.\n\nFILAS DE LA COLUMNA OBJETIVO:\n'+
+  rows.map(r=>r.id+' | '+r.label+' | '+r.value).join('\n');
+ try{
+  const raw=await s.prompt(prompt,{signal:state.controller.signal});
+  const parsed=parseJsonLoose(raw),seen=new Set(),out=[];
+  for(const m of (Array.isArray(parsed.mappings)?parsed.mappings:[])){
+   if(!m||!technicalFields.includes(m.field)||seen.has(m.row_id))continue;
+   const row=rows.find(r=>r.id===m.row_id);if(!row)continue;
+   seen.add(m.row_id);
+   const ev=row.label+' '+row.value;
+   const semantic=semanticMatch(m.field,row.label);
+   if(!semantic)continue;
+   out.push({
+    field:m.field,value:row.value,unit:'',evidence:ev,model_context:target,
+    docName:c.docName,pageNumber:c.pageNumber,docRole:c.docRole,via:'tabla · columna fija',
+    verification:{ok:true,reason:'Etiqueta clasificada por IA; valor tomado determinísticamente de la columna física de '+target+'.'}
+   });
+  }
+  return {results:out,column:col};
+ }catch(e){
+  state.aiErrors.push({docName:c.docName,pageNumber:c.pageNumber,name:e?.name||'Error',message:'Tabla: '+(e?.message||String(e))});
+  return {results:[],column:col};
+ }
+}
 async function analyzePage(c){
- const s=await ensureSession(),target=norm($('#model').value);
+ const target=norm($('#model').value);
+ if(c.docRole==='ficha técnica'&&target){
+  const tab=await analyzeDatasheetColumn(c);
+  if(tab&&tab.results.length)return tab.results;
+ }
+ const s=await ensureSession();
  const technicalFields=['manufacturer','model','rated_ac_power','max_apparent_power','nominal_ac_voltage','rated_ac_current','max_ac_current','frequency','power_factor','thdi','ac_connection'];
  const manualFields=['ac_terminal_cable_range','recommended_ac_cable_section','minimum_ac_cable_section','maximum_ac_cable_section','recommended_ac_breaker','installation_condition'];
  const allowed=(c.docRole==='manual'?manualFields:(c.docRole==='ficha técnica'?technicalFields:[...technicalFields,...manualFields])).join(', ');
@@ -410,10 +500,17 @@ async function analyzePageVision(c){
  }
 }
 function renderCandidates(){const el=$('#cand');el.innerHTML=state.candidates.map(c=>'<div class="candidate"><div><b>'+esc(c.docName)+' · pág. '+c.pageNumber+'</b><div class="muted">'+esc(c.docRole||'otro')+' · '+esc(c.hits.slice(0,5).join(' · '))+'</div></div><span class="score">score '+c.score+'</span></div>').join('');$('#candSec').classList.remove('hidden')}
+function resultTable(rows,label){
+ if(!rows.length)return '<div class="notice">No se obtuvo ningún dato verificado. El sistema no rellena valores por inferencia.</div>';
+ return '<table><thead><tr><th>Campo</th><th>Valor</th><th>Modelo</th><th>Estado</th><th>Fuente</th><th>Evidencia</th></tr></thead><tbody>'+
+ rows.map(x=>'<tr><td>'+esc(label[x.field]||x.field)+'</td><td><b>'+esc(x.value)+' '+esc(x.unit)+'</b></td><td>'+esc(x.model_context||'—')+'</td><td><span class="pill '+(x.verification.ok?'verified':'review')+'">'+(x.verification.ok?'Verificado':'Rechazado')+'</span></td><td>'+esc(x.docName)+' · pág. '+x.pageNumber+'<br><span class="muted">'+esc(x.docRole||'otro')+' · '+esc(x.via||'texto')+'</span></td><td class="evidence">“'+esc(x.evidence)+'”<br><span class="muted">'+esc(x.verification.reason)+'</span></td></tr>').join('')+
+ '</tbody></table>';
+}
 function renderResults(){
- const label=Object.fromEntries(fields),verified=state.results.filter(x=>x.verification.ok).length;$('#summary').innerHTML='<b>'+verified+' campos verificados</b> · '+(state.results.length-verified)+' requieren revisión. Gemini Nano recibió '+state.candidates.length+' de '+state.pages.length+' páginas revisadas localmente.'+(state.aiErrors.length?' <b>'+state.aiErrors.length+' página(s) dieron error de IA y se omitieron sin inventar datos.</b>':'');
- const rows=state.results.map(x=>'<tr><td>'+esc(label[x.field]||x.field)+'</td><td><b>'+esc(x.value)+' '+esc(x.unit)+'</b></td><td>'+esc(x.model_context||'—')+'</td><td><span class="pill '+(x.verification.ok?'verified':'review')+'">'+(x.verification.ok?'Verificado':'Revisión')+'</span></td><td>'+esc(x.docName)+' · pág. '+x.pageNumber+'<br><span class="muted">'+esc(x.docRole||'otro')+' · '+esc(x.via||'texto')+'</span></td><td class="evidence">“'+esc(x.evidence)+'”<br><span class="muted">'+esc(x.verification.reason)+'</span></td></tr>').join('');
- $('#results').innerHTML=rows?'<table><thead><tr><th>Campo</th><th>Valor</th><th>Modelo</th><th>Estado</th><th>Fuente</th><th>Evidencia</th></tr></thead><tbody>'+rows+'</tbody></table>':'<div class="notice">No se obtuvo ningún dato verificable. El sistema no rellena valores por inferencia.</div>';$('#raw').textContent=JSON.stringify(state.results,null,2);$('#resSec').classList.remove('hidden')
+ const label=Object.fromEntries(fields),ok=state.results.filter(x=>x.verification.ok),rejected=state.results.filter(x=>!x.verification.ok);
+ $('#summary').innerHTML='<b>'+ok.length+' campos verificados</b> · '+rejected.length+' propuestas rechazadas. Gemini Nano recibió '+state.candidates.length+' de '+state.pages.length+' páginas revisadas localmente.'+(state.aiErrors.length?' <b>'+state.aiErrors.length+' página(s) dieron error de IA y se omitieron.</b>':'');
+ $('#results').innerHTML=resultTable(ok,label)+(rejected.length?'<details style="margin-top:12px"><summary>Ver propuestas rechazadas ('+rejected.length+')</summary>'+resultTable(rejected,label)+'</details>':'');
+ $('#raw').textContent=JSON.stringify({verified:ok,rejected,aiErrors:state.aiErrors},null,2);$('#resSec').classList.remove('hidden')
 }
 async function run(){
  state.controller=new AbortController();state.docs=[];state.pages=[];state.candidates=[];state.results=[];state.aiErrors=[];$('#cancel').classList.remove('hidden');$('#analyze').disabled=true;$('#resSec').classList.add('hidden');$('#candSec').classList.add('hidden');
@@ -422,8 +519,9 @@ async function run(){
 const techCandidates=state.candidates.filter(x=>x.docRole==='ficha técnica');
 for(const cand of techCandidates){
  const current=state.results.filter(r=>r.docName===cand.docName&&r.pageNumber===cand.pageNumber&&r.verification?.ok).length;
- if(current<3){
-  setProgress(94,'Refinando tablas de ficha técnica','Visión local · '+cand.docName+' · pág. '+cand.pageNumber);
+ const hasPhysicalColumn=!!extractTargetColumn(cand,norm($('#model').value));
+ if(current<3&&!hasPhysicalColumn){
+  setProgress(94,'Refinando ficha sin columna detectable','Visión local · '+cand.docName+' · pág. '+cand.pageNumber);
   state.results.push(...await analyzePageVision(cand));
  }
 }
